@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useI18n } from "../i18n";
 import { api } from "../api";
 import { isHttpStatus, retryAfterSeconds } from "../api/errors";
@@ -16,6 +16,7 @@ import {
   UserIcon,
 } from "./icons";
 import { InlineEdit } from "./InlineEdit";
+import { qrSvg } from "../lib/qrSvg";
 import "./profile-dropdown.css";
 
 interface ProfileDropdownProps {
@@ -150,6 +151,29 @@ export function ProfileDropdown({
   useEffect(() => {
     if (open) setView("main");
   }, [open]);
+
+  // 🔴 THE QR IS AN ENHANCEMENT, AND MUST FAIL LIKE ONE. It is computed here
+  // rather than inline in the JSX because a throw during render unmounts the
+  // whole dropdown — taking the setup key, the otpauth link AND the disable
+  // button with it, which is the opposite of what an owner needs at that moment.
+  //
+  // It can genuinely throw: the issuer/account baked into the URI come from the
+  // owner-settable org name and nickname, so a long enough studio name pushes
+  // the payload past what a QR symbol can hold. When that happens the primary
+  // path — the copyable key and the otpauth link — is still right there.
+  //
+  // It MUST stay above the `if (!open)` gate below: a hook after an early
+  // return changes the hook COUNT between the closed and open renders, which
+  // React rejects outright ("Rendered more hooks than during the previous
+  // render") and which crashes the very dropdown this memo exists to protect.
+  const mfaQr = useMemo(() => {
+    if (!mfaPending?.otpauthUri) return null;
+    try {
+      return qrSvg(mfaPending.otpauthUri, { size: 176, title: t.profile.mfaQrAlt });
+    } catch {
+      return null;
+    }
+  }, [mfaPending?.otpauthUri, t.profile.mfaQrAlt]);
 
   if (!open) return null;
 
@@ -636,11 +660,34 @@ export function ProfileDropdown({
           {/* ── PENDING: show the secret once, take a code to prove it ── */}
           {mfaPending && (
             <form className="profile-dd__form" onSubmit={handleMfaActivate}>
+              {/* The QR is built from the SAME otpauth URI shown below, in the
+                  browser — nothing is fetched and the secret never leaves the
+                  page. dangerouslySetInnerHTML is safe here because qrSvg emits
+                  a fixed shape from a fixed template and escapes its one
+                  interpolated attribute; there is no caller-supplied markup.
+                  When it could not be built, the key and link below carry the
+                  whole flow on their own — so the hint changes with it rather
+                  than pointing at a picture that is not there. */}
+              {mfaQr && (
+                <>
+                  <div className="profile-dd__hint">
+                    {t.profile.mfaScanQrHint}
+                  </div>
+                  <div
+                    className="profile-dd__qr"
+                    dangerouslySetInnerHTML={{ __html: mfaQr }}
+                  />
+                </>
+              )}
               <div className="profile-dd__hint">{t.profile.mfaScanHint}</div>
-              {/* The secret is shown as selectable text, not a QR: this menu has
-                  no QR renderer and adding an image dependency for one screen is
-                  not worth it. The otpauth link below does the same job on the
-                  device most owners will use. */}
+              {/* The secret is ALSO shown as selectable text, beside the QR
+                  above. Three routes into an authenticator — scan, tap the
+                  otpauth link, or type the key — because each fails in a
+                  different place: the QR needs a second camera-equipped device,
+                  the link needs the cockpit to be open ON that device, and the
+                  key needs neither but is the most error-prone to transcribe.
+                  The key is also the fallback when the QR cannot be built at
+                  all (see mfaQr). */}
               <div className="profile-dd__hint">
                 {t.profile.mfaSecretLabel}
               </div>

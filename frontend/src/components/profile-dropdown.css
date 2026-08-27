@@ -467,3 +467,16 @@
      logout row's treatment. */
   color: var(--color-danger);
 }
+
+/* The enrolment QR.
+   🔴 NO BACKGROUND HERE ON PURPOSE. The symbol needs an opaque LIGHT quiet zone
+   or it stops scanning, and qrSvg already paints one inside the SVG — which is
+   where it belongs, because that is the layer where it is load-bearing rather
+   than decorative. Painting it again in CSS would be the same fact in two
+   places, and the CSS copy would have to be a raw literal (a theme token could
+   be re-valued dark by a theme pack and silently break scanning). Centring and
+   killing the inline-element line box is all this rule owes. */
+.profile-dd__qr {
+  align-self: center;
+  line-height: 0;
+}

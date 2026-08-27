@@ -655,6 +655,9 @@ export const en: Dict = {
       "Add a code from your phone's authenticator app to every sign-in. Recommended if this server is reachable from outside your machine.",
     mfaEnrollStart: "Set up two-factor",
     mfaEnrollStarting: "Preparing…",
+    mfaScanQrHint:
+      "Scan this with your authenticator app, or enter the setup key by hand.",
+    mfaQrAlt: "Setup QR code for two-factor authentication",
     mfaScanHint:
       "Add this to your authenticator app, then enter the code it shows to confirm.",
     mfaSecretLabel: "Setup key",

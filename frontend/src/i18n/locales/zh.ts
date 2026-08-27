@@ -731,6 +731,8 @@ export const zh = {
       "每次登入都要再輸入一次手機驗證器 App 的驗證碼。如果這台 server 可以從外部連進來，建議開啟。",
     mfaEnrollStart: "設定兩步驟驗證",
     mfaEnrollStarting: "準備中…",
+    mfaScanQrHint: "用驗證器 App 掃描，或手動輸入下面的設定金鑰。",
+    mfaQrAlt: "兩步驟驗證的設定 QR code",
     mfaScanHint: "把這組金鑰加進驗證器 App，然後輸入它顯示的驗證碼來確認。",
     mfaSecretLabel: "設定金鑰",
     mfaOpenInApp: "用驗證器 App 開啟",

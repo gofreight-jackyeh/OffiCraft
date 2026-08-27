@@ -259,3 +259,54 @@ describe("ProfileDropdown — the ship-dark rollout flag", () => {
     await utils.findByText(p.mfaDisabled);
   });
 });
+
+describe("ProfileDropdown — the enrolment QR", () => {
+  it("renders a QR built in the browser, alongside the key and the link", async () => {
+    await offerMfa();
+    const utils = await openMfa();
+    fireEvent.click(await utils.findByText(p.mfaEnrollStart));
+    await utils.findByText(p.mfaScanHint);
+
+    const svg = utils.container.querySelector("svg[role='img']");
+    expect(svg).toBeTruthy();
+    // Nothing is fetched: a QR "service" would mean posting the TOTP secret to
+    // a third party.
+    expect(utils.container.innerHTML).not.toContain("<image");
+    expect(utils.container.innerHTML).not.toContain("data:");
+    // The key and the otpauth link remain the primary path.
+    expect(utils.getByText(/^[A-Z2-7]{16,}$/)).toBeTruthy();
+    expect(utils.getByText(p.mfaOpenInApp)).toBeTruthy();
+  });
+
+  // 🔴 The QR is an ENHANCEMENT and must fail like one. A throw during render
+  // would unmount the dropdown and take the setup key, the otpauth link and the
+  // disable button with it — exactly what an owner must not lose at that moment.
+  // The payload is reachable-long in practice: issuer/account come from the
+  // owner-settable org name and nickname.
+  it("degrades to the key and link when the QR cannot be built", async () => {
+    // The secret is a flat placeholder, not a plausible-looking key: nothing
+    // here decodes it (enrollMfa is mocked and qrSvg just encodes the string),
+    // and a high-entropy base32 literal in a test file is indistinguishable
+    // from a real leaked one to a secret scanner. What actually drives this
+    // test is `huge` — the oversized label that exceeds QR capacity.
+    const secret = "AAAAAAAAAAAAAAAA";
+    const huge = "y".repeat(4000);
+    vi.spyOn(api, "enrollMfa").mockResolvedValue({
+      secret,
+      otpauthUri: `otpauth://totp/${huge}:owner?secret=${secret}`,
+    });
+
+    await offerMfa();
+    const utils = await openMfa();
+    fireEvent.click(await utils.findByText(p.mfaEnrollStart));
+
+    // The panel still works…
+    await utils.findByText(p.mfaScanHint);
+    expect(utils.getByText(/^[A-Z2-7]{16,}$/)).toBeTruthy();
+    expect(utils.getByText(p.mfaOpenInApp)).toBeTruthy();
+    expect(utils.getByLabelText(p.mfaCodePlaceholder)).toBeTruthy();
+    // …with no QR, and no scan-the-QR instruction pointing at a missing picture.
+    expect(utils.container.querySelector("svg[role='img']")).toBeNull();
+    expect(utils.queryByText(p.mfaScanQrHint)).toBeNull();
+  });
+});
