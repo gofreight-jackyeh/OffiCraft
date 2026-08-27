@@ -715,6 +715,17 @@ export const zh = {
     // ── 第二因子(TOTP) ──
     mfa: "兩步驟驗證",
     mfaSubOff: "未開啟 — 你的密碼是唯一的鑰匙",
+    // 出貨旗標。獨立一句,因為「這台 server 沒開放這個功能」跟「你還沒去設定」
+    // 是兩件事;混在一起會讓人去找一個刻意不存在的按鈕。
+    mfaSubUnavailable: "這台 server 未啟用此功能",
+    mfaOfferIntro:
+      "這台 server 尚未開放兩步驟驗證。開放之後才能設定——這只是讓選項出現，不會替任何人開啟。",
+    mfaOfferOn: "為這台 server 開放兩步驟驗證",
+    mfaOfferOff: "關閉這台 server 的此功能",
+    // 明講,因為這正是這個旗標的安全性重點。
+    mfaOfferOffHint:
+      "這只會把設定入口收起來。已經開啟的第二因子仍然會在登入時被要求，也仍然可以從上面關掉。",
+    mfaErrorOffer: "無法變更這個設定",
     mfaSubOn: "已開啟 — 登入時需要驗證器的驗證碼",
     mfaIntro:
       "每次登入都要再輸入一次手機驗證器 App 的驗證碼。如果這台 server 可以從外部連進來，建議開啟。",

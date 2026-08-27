@@ -19,6 +19,7 @@ import type {
   BackupHealthView,
   AuthStatusView,
   MfaEnrollView,
+  MfaStateView,
   GlobalContextView,
   BootDocKind,
   BootDocView,
@@ -2370,6 +2371,22 @@ export interface Api {
    * would leak strictly more (it confirms a correct password).
    */
   getAuthStatus(): Promise<AuthStatusView>;
+  /**
+   * Read the owner's second-factor state (`GET /api/auth/mfa`, owner-gated):
+   * whether this server OFFERS the factor, and whether one is armed.
+   *
+   * Deliberately NOT a field on `getSettings`: that route's floor is
+   * admin_agent and its GET is an MCP tool, so the owner's credential posture
+   * would be readable by every agent in the office.
+   */
+  getMfaState(): Promise<MfaStateView>;
+  /**
+   * Turn the second-factor FEATURE on or off (`POST /api/auth/mfa/offer`,
+   * owner-gated). A rollout switch only: turning it off hides the set-up path
+   * but never disarms an armed factor, never stops login demanding a code, and
+   * never blocks `disableMfa`.
+   */
+  setMfaOffered(offered: boolean): Promise<MfaStateView>;
   /**
    * Begin TOTP enrolment (`POST /api/auth/mfa/enroll`, owner-gated). Returns
    * the PENDING secret + otpauth URI once; nothing is armed until

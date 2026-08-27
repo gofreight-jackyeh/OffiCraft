@@ -93,6 +93,10 @@ export function ProfileDropdown({
   // only key" from an unread default tells an owner whose factor IS armed the
   // exact opposite of the truth, on every fresh mount of the menu.
   const [mfaEnrolled, setMfaEnrolled] = useState<boolean | null>(null);
+  // The ship-dark rollout flag. null = not read yet (same "never fabricate a
+  // default" rule as mfaEnrolled): claiming the feature is unavailable when we
+  // simply have not asked would hide a button the owner does have.
+  const [mfaOffered, setMfaOffered] = useState<boolean | null>(null);
   const [mfaLoaded, setMfaLoaded] = useState(false);
   // The PENDING enrolment, held in component state ONLY — never persisted. It
   // is the one moment a secret exists on this client, and it dies with the view.
@@ -105,7 +109,7 @@ export function ProfileDropdown({
   const [mfaBusy, setMfaBusy] = useState(false);
   const [mfaNotice, setMfaNotice] = useState<"" | "activated" | "disabled">("");
   const [mfaError, setMfaError] = useState<
-    "" | "code" | "disable" | "load" | "throttled" | "session"
+    "" | "code" | "disable" | "load" | "throttled" | "session" | "offer"
   >("");
   /** Seconds from a 429's Retry-After, for the throttled message. */
   const [mfaRetryAfter, setMfaRetryAfter] = useState(0);
@@ -122,13 +126,20 @@ export function ProfileDropdown({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    // The owner-gated state route, not the public probe: it carries the rollout
+    // flag too, and the flag is not something to publish to unauthenticated
+    // callers.
     api
-      .getAuthStatus()
-      .then((status) => {
-        if (!cancelled) setMfaEnrolled(status.mfaRequired);
+      .getMfaState()
+      .then((state) => {
+        if (cancelled) return;
+        setMfaEnrolled(state.enrolled);
+        setMfaOffered(state.offered);
       })
       .catch(() => {
-        if (!cancelled) setMfaEnrolled(null);
+        if (cancelled) return;
+        setMfaEnrolled(null);
+        setMfaOffered(null);
       });
     return () => {
       cancelled = true;
@@ -202,6 +213,21 @@ export function ProfileDropdown({
     return credentialKey;
   }
 
+  async function handleMfaOffer(next: boolean) {
+    if (mfaBusy) return;
+    setMfaBusy(true);
+    setMfaError("");
+    try {
+      const state = await api.setMfaOffered(next);
+      setMfaOffered(state.offered);
+      setMfaEnrolled(state.enrolled);
+    } catch {
+      setMfaError("offer");
+    } finally {
+      setMfaBusy(false);
+    }
+  }
+
   async function openMfaView() {
     setMfaPending(null);
     setMfaCode("");
@@ -213,8 +239,9 @@ export function ProfileDropdown({
     setMfaLoaded(false);
     setView("mfa");
     try {
-      const status = await api.getAuthStatus();
-      setMfaEnrolled(status.mfaRequired);
+      const state = await api.getMfaState();
+      setMfaEnrolled(state.enrolled);
+      setMfaOffered(state.offered);
       setMfaLoaded(true);
     } catch {
       // HONEST: no guess. Without knowing the current state this view cannot
@@ -407,7 +434,7 @@ export function ProfileDropdown({
 
           <button type="button" className="profile-dd__row" onClick={openMfaView}>
             <span className="profile-dd__row-icon"><GearIcon size={16} /></span>
-            <span className="profile-dd__row-body"><span className="profile-dd__row-title">{t.profile.mfa}</span><span className="profile-dd__row-sub">{mfaEnrolled === null ? "" : mfaEnrolled ? t.profile.mfaSubOn : t.profile.mfaSubOff}</span></span>
+            <span className="profile-dd__row-body"><span className="profile-dd__row-title">{t.profile.mfa}</span><span className="profile-dd__row-sub">{mfaEnrolled === null || mfaOffered === null ? "" : mfaEnrolled ? t.profile.mfaSubOn : mfaOffered ? t.profile.mfaSubOff : t.profile.mfaSubUnavailable}</span></span>
             <ChevronRightIcon size={16} className="profile-dd__row-chevron" />
           </button>
 
@@ -564,7 +591,26 @@ export function ProfileDropdown({
           )}
 
           {/* ── OFF, nothing pending: offer to start ── */}
-          {mfaLoaded && mfaEnrolled === false && !mfaPending && (
+          {/* Feature withdrawn AND nothing armed: the only thing on offer is the
+              rollout switch itself. */}
+          {mfaLoaded && mfaOffered === false && mfaEnrolled === false && (
+            <div className="profile-dd__form">
+              <div className="profile-dd__hint">{t.profile.mfaOfferIntro}</div>
+              {mfaError === "offer" && (
+                <div className="profile-dd__error">{t.profile.mfaErrorOffer}</div>
+              )}
+              <button
+                type="button"
+                className="profile-dd__submit"
+                disabled={mfaBusy}
+                onClick={() => handleMfaOffer(true)}
+              >
+                {mfaBusy ? t.profile.mfaEnrollStarting : t.profile.mfaOfferOn}
+              </button>
+            </div>
+          )}
+
+          {mfaLoaded && mfaOffered === true && mfaEnrolled === false && !mfaPending && (
             <div className="profile-dd__form">
               <div className="profile-dd__hint">{t.profile.mfaIntro}</div>
               <button
@@ -575,6 +621,15 @@ export function ProfileDropdown({
               >
                 {mfaBusy ? t.profile.mfaEnrollStarting : t.profile.mfaEnrollStart}
               </button>
+              <button
+                type="button"
+                className="profile-dd__submit profile-dd__submit--danger"
+                disabled={mfaBusy}
+                onClick={() => handleMfaOffer(false)}
+              >
+                {t.profile.mfaOfferOff}
+              </button>
+              <div className="profile-dd__hint">{t.profile.mfaOfferOffHint}</div>
             </div>
           )}
 

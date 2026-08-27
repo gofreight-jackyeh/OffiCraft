@@ -32,6 +32,7 @@ import type {
   BackupHealthView,
   AuthStatusView,
   MfaEnrollView,
+  MfaStateView,
   GlobalContextView,
   BootDocKind,
   BootDocView,
@@ -1720,6 +1721,20 @@ export const httpApi: Api = {
       passwordSet: wire.password_set,
       mfaRequired: wire.mfa_required ?? false,
     };
+  },
+
+  async getMfaState(): Promise<MfaStateView> {
+    // Owner-gated, so the typed client is right: a 401 here really does mean the
+    // session died, and bouncing the auth wall is the honest reaction.
+    const wire = unwrap(await client.GET("/api/auth/mfa"));
+    return { offered: wire.offered, enrolled: wire.enrolled };
+  },
+
+  async setMfaOffered(offered: boolean): Promise<MfaStateView> {
+    const wire = unwrap(
+      await client.POST("/api/auth/mfa/offer", { body: { offered } }),
+    );
+    return { offered: wire.offered, enrolled: wire.enrolled };
   },
 
   async enrollMfa(): Promise<MfaEnrollView> {

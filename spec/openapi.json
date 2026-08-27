@@ -2106,11 +2106,31 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "MfaOfferDTO": {
+        "description": "Turn the second-factor FEATURE on or off for this server (`POST /api/auth/mfa/offer`, owner-gated).\n\nThis is a rollout switch, not a security switch: it decides whether the factor can be SET UP, and never whether an armed one is verified. Turning it off while a factor is armed is allowed and deliberately changes nothing about login — the owner still needs their code, and still removes the factor through `…/disable` (password + live code) or the local `ocserverd mfa-disable`.",
+        "properties": {
+          "offered": {
+            "title": "Offered",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "offered"
+        ],
+        "title": "MfaOfferDTO",
+        "additionalProperties": false,
+        "type": "object"
+      },
       "MfaStateDTO": {
         "description": "The owner's second-factor state, answered by every `/api/auth/mfa/*` write.\n\n`enrolled` is the armed bit — true only once a pending secret has been PROVEN by `…/activate`.\n\n`secret` and `otpauth_uri` are non-null ONLY in the response to `…/enroll`, and only for the pending (not yet armed) secret. They are the one moment the secret crosses the wire, because an authenticator app cannot be enrolled without it; the server never echoes an ACTIVE secret back afterwards, so a stolen owner token cannot read out an existing enrolment and clone it.",
         "properties": {
           "enrolled": {
             "title": "Enrolled",
+            "type": "boolean"
+          },
+          "offered": {
+            "description": "Whether this server OFFERS the second factor at all — the ship-dark feature flag (`auth.mfa_offered`, default false so an existing install is unaffected until its owner turns it on).\n\n🔴 IT GATES SET-UP, NEVER VERIFICATION. While false, `…/enroll` and `…/activate` are refused and the cockpit hides the entry; a factor that is ALREADY armed keeps being enforced at login exactly as before, and `…/disable` keeps working. Making the flag switch verification off would turn it into a bypass — a stolen owner token could simply withdraw the feature and walk past the factor it is supposed to be stopped by, which is the same reasoning that makes `…/disable` demand both factors.",
+            "title": "Offered",
             "type": "boolean"
           },
           "otpauth_uri": {
@@ -2139,6 +2159,7 @@
           }
         },
         "required": [
+          "offered",
           "enrolled",
           "secret",
           "otpauth_uri"
@@ -8531,6 +8552,58 @@
         }
       }
     },
+    "/api/auth/mfa": {
+      "get": {
+        "description": "The owner cockpit's read of the second-factor state (owner-gated): whether the server OFFERS the factor at all, and whether one is currently armed.\n\nIt exists as its own owner-gated route rather than as a field on `GET /api/settings` on purpose: that route's floor is admin_agent and its GET is an MCP tool, so putting the owner's credential posture there would hand it to every agent. `secret` and `otpauth_uri` are always null here — a secret is disclosed exactly once, by `…/enroll`.",
+        "operationId": "handle_mfa_state_api_auth_mfa_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStateDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Validation error (unified error envelope)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Client error (unified error envelope)."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Server error (unified error envelope)."
+          }
+        },
+        "summary": "Read the owner's second-factor state (offered + enrolled).",
+        "x-mcp": {
+          "include": false
+        }
+      }
+    },
     "/api/auth/mfa/activate": {
       "post": {
         "description": "Prove a pending TOTP enrolment and arm the second factor (owner-gated).\n\nOn success the pending secret becomes the active one, the pending slot is cleared, and `/api/login` demands a code from the next login onward. Existing owner tokens are deliberately NOT revoked: the session doing this just proved the password (to log in) and now the code as well, so it is the most strongly authenticated session on the install — logging it out would be theatre.\n\n409 when there is no pending secret to prove, or when a factor is already active. A wrong code is 401 and leaves the pending secret intact for a retry.",
@@ -8650,6 +8723,68 @@
           }
         },
         "summary": "Turn the second factor off (password + live code required).",
+        "x-mcp": {
+          "include": false
+        }
+      }
+    },
+    "/api/auth/mfa/offer": {
+      "post": {
+        "description": "Set the ship-dark feature flag `auth.mfa_offered` (owner-gated).\n\nOFF (the default, so an existing install is unaffected until its owner opts in) means `…/enroll` and `…/activate` answer 403 and the cockpit hides the entry.\n\n🔴 It NEVER affects verification. An already-armed factor keeps being demanded at login while this is false, `GET /api/auth/status` keeps reporting `mfa_required: true`, and `…/disable` keeps working — otherwise the flag would be a way for a stolen owner token to walk past the very factor that exists to stop it.",
+        "operationId": "handle_mfa_offer_api_auth_mfa_offer_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaOfferDTO"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStateDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Validation error (unified error envelope)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Client error (unified error envelope)."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Server error (unified error envelope)."
+          }
+        },
+        "summary": "Turn the second-factor feature on or off for this server.",
         "x-mcp": {
           "include": false
         }

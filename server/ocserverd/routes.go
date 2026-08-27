@@ -190,6 +190,24 @@ func routeSpecs(w *ServerInterfaceWrapper) []RouteSpec {
 		// credential that governs it, and arming or disarming the owner's factor
 		// is never something an agent does on the owner's behalf.
 		{
+			Method:     "GET",
+			Path:       "/api/auth/mfa",
+			Handler:    w.HandleMfaStateApiAuthMfaGet,
+			Auth:       authGated,
+			Requires:   principalOwner,
+			Summary:    "Read the owner's second-factor state (offered + enrolled).",
+			MCPExclude: true,
+		},
+		{
+			Method:     "POST",
+			Path:       "/api/auth/mfa/offer",
+			Handler:    w.HandleMfaOfferApiAuthMfaOfferPost,
+			Auth:       authGated,
+			Requires:   principalOwner,
+			Summary:    "Turn the second-factor feature on or off for this server.",
+			MCPExclude: true,
+		},
+		{
 			Method:     "POST",
 			Path:       "/api/auth/mfa/enroll",
 			Handler:    w.HandleMfaEnrollApiAuthMfaEnrollPost,

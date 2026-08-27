@@ -114,6 +114,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/mfa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the owner's second-factor state (offered + enrolled).
+         * @description The owner cockpit's read of the second-factor state (owner-gated): whether the server OFFERS the factor at all, and whether one is currently armed.
+         *
+         *     It exists as its own owner-gated route rather than as a field on `GET /api/settings` on purpose: that route's floor is admin_agent and its GET is an MCP tool, so putting the owner's credential posture there would hand it to every agent. `secret` and `otpauth_uri` are always null here — a secret is disclosed exactly once, by `…/enroll`.
+         */
+        get: operations["handle_mfa_state_api_auth_mfa_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/mfa/activate": {
         parameters: {
             query?: never;
@@ -158,6 +180,30 @@ export interface paths {
          *     409 when no factor is active; 401 on a wrong password or code.
          */
         post: operations["handle_mfa_disable_api_auth_mfa_disable_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/mfa/offer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Turn the second-factor feature on or off for this server.
+         * @description Set the ship-dark feature flag `auth.mfa_offered` (owner-gated).
+         *
+         *     OFF (the default, so an existing install is unaffected until its owner opts in) means `…/enroll` and `…/activate` answer 403 and the cockpit hides the entry.
+         *
+         *     🔴 It NEVER affects verification. An already-armed factor keeps being demanded at login while this is false, `GET /api/auth/status` keeps reporting `mfa_required: true`, and `…/disable` keeps working — otherwise the flag would be a way for a stolen owner token to walk past the very factor that exists to stop it.
+         */
+        post: operations["handle_mfa_offer_api_auth_mfa_offer_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5567,6 +5613,16 @@ export interface components {
             password: string;
         };
         /**
+         * MfaOfferDTO
+         * @description Turn the second-factor FEATURE on or off for this server (`POST /api/auth/mfa/offer`, owner-gated).
+         *
+         *     This is a rollout switch, not a security switch: it decides whether the factor can be SET UP, and never whether an armed one is verified. Turning it off while a factor is armed is allowed and deliberately changes nothing about login — the owner still needs their code, and still removes the factor through `…/disable` (password + live code) or the local `ocserverd mfa-disable`.
+         */
+        MfaOfferDTO: {
+            /** Offered */
+            offered: boolean;
+        };
+        /**
          * MfaStateDTO
          * @description The owner's second-factor state, answered by every `/api/auth/mfa/*` write.
          *
@@ -5577,6 +5633,13 @@ export interface components {
         MfaStateDTO: {
             /** Enrolled */
             enrolled: boolean;
+            /**
+             * Offered
+             * @description Whether this server OFFERS the second factor at all — the ship-dark feature flag (`auth.mfa_offered`, default false so an existing install is unaffected until its owner turns it on).
+             *
+             *     🔴 IT GATES SET-UP, NEVER VERIFICATION. While false, `…/enroll` and `…/activate` are refused and the cockpit hides the entry; a factor that is ALREADY armed keeps being enforced at login exactly as before, and `…/disable` keeps working. Making the flag switch verification off would turn it into a bypass — a stolen owner token could simply withdraw the feature and walk past the factor it is supposed to be stopped by, which is the same reasoning that makes `…/disable` demand both factors.
+             */
+            offered: boolean;
             /**
              * Otpauth Uri
              * @description The `otpauth://totp/…` URI for a pending enrolment (QR / deep-link form), else null.
@@ -9752,6 +9815,53 @@ export interface operations {
             };
         };
     };
+    handle_mfa_state_api_auth_mfa_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStateDTO"];
+                };
+            };
+            /** @description Validation error (unified error envelope). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Client error (unified error envelope). */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Server error (unified error envelope). */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+        };
+    };
     handle_mfa_activate_api_auth_mfa_activate_post: {
         parameters: {
             query?: never;
@@ -9813,6 +9923,57 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["MfaDisableDTO"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStateDTO"];
+                };
+            };
+            /** @description Validation error (unified error envelope). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Client error (unified error envelope). */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Server error (unified error envelope). */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+        };
+    };
+    handle_mfa_offer_api_auth_mfa_offer_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaOfferDTO"];
             };
         };
         responses: {

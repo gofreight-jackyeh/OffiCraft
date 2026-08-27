@@ -59,6 +59,10 @@ type authStatusDTO struct {
 // a pending (unproven) secret — an ACTIVE secret is never echoed back, so a
 // stolen owner token cannot read out an existing enrolment and clone it.
 type mfaStateDTO struct {
+	// Offered is the ship-dark feature flag — whether the factor may be SET UP.
+	// NOT a second opinion on whether one is armed (that is Enrolled), and never
+	// consulted when deciding to verify a code.
+	Offered    bool    `json:"offered"`
 	Enrolled   bool    `json:"enrolled"`
 	Secret     *string `json:"secret"`
 	OtpauthURI *string `json:"otpauth_uri"`

@@ -207,6 +207,31 @@ def _check_login(_ctx: HCtx, r: httpx.Response) -> None:
     assert data["token"] and data["token_type"] == "bearer", data
 
 
+def _happy_mfa_enroll_path(ctx: HCtx) -> str:
+    """Seed the ship-dark flag so enrol answers 200 rather than 403. Inert:
+    offering the factor arms nothing, so no later login fixture needs a code."""
+    ctx.client.post(
+        "/api/auth/mfa/offer",
+        json={"offered": True},
+        headers=_auth(ctx.owner_token),
+    )
+    return "/api/auth/mfa/enroll"
+
+
+def _check_mfa_state(_ctx: HCtx, r: httpx.Response) -> None:
+    data = r.json()
+    assert isinstance(data["offered"], bool), data
+    assert isinstance(data["enrolled"], bool), data
+    # A secret is disclosed exactly once, by enrol — never by the state read.
+    assert data["secret"] is None and data["otpauth_uri"] is None, data
+
+
+def _check_mfa_offer(_ctx: HCtx, r: httpx.Response) -> None:
+    data = r.json()
+    assert data["offered"] is True, data
+    assert data["enrolled"] is False, "offering the feature must not arm anything"
+
+
 def _check_mfa_enroll(_ctx: HCtx, r: httpx.Response) -> None:
     data = r.json()
     # enroll hands back a usable secret AND must NOT claim the factor is armed:
@@ -984,7 +1009,15 @@ HAPPY: dict[str, Happy] = {
     # the run would need a TOTP code. The full ceremony is exercised instead by
     # test_mfa_full_ceremony below, which arms AND disarms inside one test so
     # the install is left exactly as it was found.
-    "POST /api/auth/mfa/enroll": Happy(check=_check_mfa_enroll),
+    "GET /api/auth/mfa": Happy(check=_check_mfa_state),
+    # Turning the flag ON is the precondition for the enrol row below, and is
+    # inert on its own — offering the factor arms nothing.
+    "POST /api/auth/mfa/offer": Happy(
+        body=lambda _ctx: {"offered": True}, check=_check_mfa_offer
+    ),
+    "POST /api/auth/mfa/enroll": Happy(
+        path=_happy_mfa_enroll_path, check=_check_mfa_enroll
+    ),
     "GET /install.sh": Happy(
         identity="none",
         path="/install.sh?token=conf-happy-boot-token",
@@ -2643,6 +2676,14 @@ def test_mfa_full_ceremony(hctx: HCtx) -> None:
     # for their authenticator to roll over to a code they have not spent.
     _totp_align_to_step_start()
 
+    # The ship-dark flag gates SET-UP, and its default is OFF — an install that
+    # never opts in is untouched by this feature, so enrol would answer 403
+    # without this. Offering it arms nothing.
+    r = hctx.client.post("/api/auth/mfa/offer", json={"offered": True}, headers=owner)
+    assert r.status_code == 200, f"offer: {r.status_code} {r.text}"
+    assert r.json()["offered"] is True, r.json()
+    assert r.json()["enrolled"] is False, "offering the feature must not arm anything"
+
     # ── enroll: an INERT pending secret ──────────────────────────────────────
     r = hctx.client.post("/api/auth/mfa/enroll", headers=owner)
     assert r.status_code == 200, f"{r.status_code} {r.text}"
@@ -2706,6 +2747,22 @@ def test_mfa_full_ceremony(hctx: HCtx) -> None:
         )
         assert r.status_code == 200, f"two-factor login: {r.status_code} {r.text}"
         assert r.json()["token"], r.json()
+
+        # ── the flag is a ROLLOUT switch, not a bypass ───────────────────────
+        # Withdraw the feature while the factor is ARMED. Login must still demand
+        # the code: if this ever stops holding, anyone holding a stolen owner
+        # token could simply turn the feature off and walk past the second factor
+        # that exists to stop exactly that.
+        r = hctx.client.post("/api/auth/mfa/offer", json={"offered": False}, headers=owner)
+        assert r.status_code == 200, f"withdraw: {r.status_code} {r.text}"
+        assert r.json()["enrolled"] is True, "withdrawing the feature disarmed the factor"
+        assert (
+            hctx.client.get("/api/auth/status").json()["mfa_required"] is True
+        ), "mfa_required went false while a factor is armed — the wall would hide the code field"
+        assert (
+            hctx.client.post("/api/login", json={"password": password}).status_code == 401
+        ), "password alone logged in while the feature was withdrawn — the flag is a bypass"
+        hctx.client.post("/api/auth/mfa/offer", json={"offered": True}, headers=owner)
 
         # ── the replay guard: that same code must not work twice ─────────────
         r = hctx.client.post(

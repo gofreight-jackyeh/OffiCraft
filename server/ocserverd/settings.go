@@ -48,13 +48,33 @@ const (
 	// deleted on success (possession proves host shell access — the gate
 	// against a public-tunnel visitor claiming a fresh server).
 	settingClaimToken = "auth.claim_token"
+	// settingMFAOffered is the ship-dark FEATURE FLAG: does this server offer the
+	// second factor at all? Absent/false is the default, so an install that
+	// upgrades into this build is completely unaffected until its owner opts in.
+	//
+	// 🔴 IT GATES SET-UP, NEVER VERIFICATION, and that asymmetry is the whole
+	// safety property. While it is false, enroll/activate are refused and the
+	// cockpit hides the entry — but a factor that is ALREADY armed keeps being
+	// demanded at login, /api/auth/status keeps reporting mfa_required, and
+	// disable keeps working. If the flag switched verification off it would BE
+	// the bypass: a stolen owner token could withdraw the feature and walk past
+	// the factor that exists to stop exactly that. Same reasoning as the
+	// both-factors rule on disable.
+	settingMFAOffered = "auth.mfa_offered"
 	// The owner's TOTP second factor (totp.go). Three keys, because enrolment
 	// is a two-step ceremony and replay defence needs a floor:
 	//
 	//   settingTOTPSecret — the ACTIVE base32 secret. Present ⇒ MFA is on and
-	//     /api/login demands a code. This is the single bit that arms the second
-	//     factor; there is deliberately no separate "mfa_enabled" flag that
-	//     could disagree with the presence of a usable secret.
+	//     /api/login demands a code. This is the single bit that ARMS the second
+	//     factor.
+	//
+	//     🔴 settingMFAOffered above is NOT a second opinion about that, and the
+	//     distinction is load-bearing: "may the factor be set up" (a rollout
+	//     decision) and "is a factor armed" (a security fact) are different
+	//     questions, and only the secret answers the second one. There is still
+	//     deliberately no flag that could disagree with the presence of a usable
+	//     secret about whether login demands a code — every verification path
+	//     reads THIS key and never the flag.
 	//   settingTOTPPendingSecret — a minted-but-unproven secret, written by
 	//     enroll and consumed by activate. It exists so a secret can NEVER be
 	//     promoted to active until the owner has produced a working code from
@@ -263,6 +283,7 @@ type authSettings struct {
 	secret                       []byte
 	passwordHash                 string // "" = not set in DB (first-run: set-password flow)
 	passwordChangedAt            int64  // epoch secs; owner tokens with iat before it are refused
+	mfaOffered                   bool   // auth.mfa_offered — may the factor be SET UP? never gates verification
 	totpSecret                   string // "" = MFA off; non-empty ⇒ /api/login demands a TOTP code
 	totpLastStep                 int64  // highest TOTP step already spent (replay floor)
 	ownerTokenTTL                int64
@@ -368,6 +389,15 @@ func loadAuthSettings(d *DAL, cfg Config, logf func(string)) (authSettings, erro
 		out.passwordHash = phc
 		logf("migrated oc.toml [auth].password into DB settings as an argon2id hash")
 	}
+
+	// The ship-dark feature flag. Anything other than a literal "true" is false,
+	// including a missing row — an install that has never heard of this key must
+	// come up with the feature dark.
+	offered, err := d.GetSetting(settingMFAOffered)
+	if err != nil {
+		return out, err
+	}
+	out.mfaOffered = offered != nil && *offered == "true"
 
 	// The active TOTP secret. A stored value that does not DECODE is a hard boot
 	// error, not a silently-ignored one: the alternative is booting with MFA

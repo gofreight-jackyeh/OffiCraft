@@ -26,6 +26,13 @@ const GOOD_CODE = "123456";
 /** The password mock.ts boots with (api/mock.ts mockPassword). */
 const MOCK_PASSWORD = "mock-password";
 
+/** Turn the ship-dark rollout flag on — the precondition for the set-up path.
+ * Verification is deliberately independent of it (see the dark-by-default test
+ * at the bottom, which pins that). */
+async function offerMfa() {
+  await api.setMfaOffered(true);
+}
+
 async function openMfa() {
   const utils = render(
     <I18nProvider>
@@ -49,6 +56,7 @@ beforeEach(() => {
 
 describe("ProfileDropdown — second factor", () => {
   it("starts OFF and offers to set it up", async () => {
+    await offerMfa();
     const utils = await openMfa();
     await utils.findByText(p.mfaEnrollStart);
     // The main-menu row's subtitle is the at-a-glance state.
@@ -57,6 +65,7 @@ describe("ProfileDropdown — second factor", () => {
 
   // 🔴 Guard #1: enrolling shows the key but must NOT arm anything.
   it("enroll reveals the setup key WITHOUT arming the factor", async () => {
+    await offerMfa();
     const utils = await openMfa();
     fireEvent.click(await utils.findByText(p.mfaEnrollStart));
 
@@ -70,6 +79,7 @@ describe("ProfileDropdown — second factor", () => {
   });
 
   it("a wrong code is refused and the pending secret SURVIVES for a retry", async () => {
+    await offerMfa();
     const utils = await openMfa();
     fireEvent.click(await utils.findByText(p.mfaEnrollStart));
     const codeInput = await utils.findByLabelText(p.mfaCodePlaceholder);
@@ -94,6 +104,7 @@ describe("ProfileDropdown — second factor", () => {
 
   // 🔴 Guard #2: the secret must not linger on the client once armed.
   it("activate arms the factor and drops the secret from the screen", async () => {
+    await offerMfa();
     const utils = await openMfa();
     fireEvent.click(await utils.findByText(p.mfaEnrollStart));
 
@@ -119,9 +130,11 @@ describe("ProfileDropdown — second factor", () => {
   it("an already-armed factor offers DISABLE, not another enrolment", async () => {
     // Arm it through the adapter, then open the view fresh — the state must be
     // read from the server, not remembered from this session.
+    await offerMfa();
     await api.enrollMfa();
     await api.activateMfa(MOCK_PASSWORD, GOOD_CODE);
 
+    await offerMfa();
     const utils = await openMfa();
     await utils.findByText(p.mfaDisable);
     expect(utils.queryByText(p.mfaEnrollStart)).toBeNull();
@@ -132,8 +145,10 @@ describe("ProfileDropdown — second factor", () => {
 
   // 🔴 Guard #3: both factors, and one indistinguishable refusal.
   it("disable requires BOTH the password and a code", async () => {
+    await offerMfa();
     await api.enrollMfa();
     await api.activateMfa(MOCK_PASSWORD, GOOD_CODE);
+    await offerMfa();
     const utils = await openMfa();
     await utils.findByText(p.mfaDisable);
 
@@ -168,8 +183,10 @@ describe("ProfileDropdown — second factor", () => {
   });
 
   it("a wrong password with a good code is refused the same way", async () => {
+    await offerMfa();
     await api.enrollMfa();
     await api.activateMfa(MOCK_PASSWORD, GOOD_CODE);
+    await offerMfa();
     const utils = await openMfa();
     await utils.findByText(p.mfaDisable);
 
@@ -185,5 +202,60 @@ describe("ProfileDropdown — second factor", () => {
     await expect(api.getAuthStatus()).resolves.toMatchObject({
       mfaRequired: true,
     });
+  });
+});
+
+describe("ProfileDropdown — the ship-dark rollout flag", () => {
+  // The reason the flag exists: an existing studio that upgrades into this build
+  // must see nothing new until its owner opts in.
+  it("a dark server offers only the rollout switch, not the set-up path", async () => {
+    const utils = await openMfa();
+
+    await utils.findByText(p.mfaOfferOn);
+    expect(utils.queryByText(p.mfaEnrollStart)).toBeNull();
+    // The main-menu subtitle must say "not enabled on this server", NOT "off" —
+    // they are different facts and only one of them has a button.
+    expect(utils.queryByText(p.mfaSubOff)).toBeNull();
+  });
+
+  it("turning it on reveals the set-up path", async () => {
+    const utils = await openMfa();
+    fireEvent.click(await utils.findByText(p.mfaOfferOn));
+
+    await utils.findByText(p.mfaEnrollStart);
+    await expect(api.getMfaState()).resolves.toMatchObject({
+      offered: true,
+      enrolled: false,
+    });
+  });
+
+  // 🔴 The safety property, at the UI seam: withdrawing the feature must not
+  // disarm a factor, and must not take the off-switch away with it.
+  it("withdrawing the feature leaves an armed factor armed and removable", async () => {
+    await offerMfa();
+    await api.enrollMfa();
+    await api.activateMfa(MOCK_PASSWORD, GOOD_CODE);
+    await api.setMfaOffered(false);
+
+    // Still armed, and login still demands a code.
+    await expect(api.getMfaState()).resolves.toMatchObject({
+      offered: false,
+      enrolled: true,
+    });
+    await expect(api.getAuthStatus()).resolves.toMatchObject({
+      mfaRequired: true,
+    });
+
+    // And the owner can still take it off through the product.
+    const utils = await openMfa();
+    await utils.findByText(p.mfaDisable);
+    fireEvent.change(utils.getByLabelText(p.currentPasswordPlaceholder), {
+      target: { value: MOCK_PASSWORD },
+    });
+    fireEvent.change(utils.getByLabelText(p.mfaCodePlaceholder), {
+      target: { value: GOOD_CODE },
+    });
+    fireEvent.click(utils.getByText(p.mfaDisable));
+    await utils.findByText(p.mfaDisabled);
   });
 });

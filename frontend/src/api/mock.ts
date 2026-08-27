@@ -13,6 +13,7 @@ import type {
   BackupHealthView,
   AuthStatusView,
   MfaEnrollView,
+  MfaStateView,
   GlobalContextView,
   BootDocKind,
   BootDocView,
@@ -1727,6 +1728,9 @@ let mockPassword = "mock-password";
 // code instead — the same substitution the mock already makes for the claim
 // token. What the UI needs to be exercisable offline is the STATE MACHINE
 // (pending → armed → off) and the refusals, and those are faithful.
+// The ship-dark feature flag. Boots OFF, exactly like a real install that has
+// never opted in — so the mock cockpit shows what an untouched studio shows.
+let mockMfaOffered = false;
 let mockMfaActive = false;
 let mockMfaPending = false;
 const MOCK_TOTP_CODE = "123456";
@@ -4538,9 +4542,26 @@ export const mockApi: Api = {
     return { passwordSet: mockPasswordSet, mfaRequired: mockMfaActive };
   },
 
+  async getMfaState(): Promise<MfaStateView> {
+    return { offered: mockMfaOffered, enrolled: mockMfaActive };
+  },
+
+  async setMfaOffered(offered: boolean): Promise<MfaStateView> {
+    // A rollout switch: it never touches mockMfaActive, mirroring the server.
+    mockMfaOffered = offered;
+    return { offered: mockMfaOffered, enrolled: mockMfaActive };
+  },
+
   async enrollMfa(): Promise<MfaEnrollView> {
-    // Same check order as the server: an active factor is a 409 before any
-    // secret is minted (rotation must disable first).
+    // Same check order as the server: the feature gate first, then an active
+    // factor is a 409 before any secret is minted (rotation must disable first).
+    if (!mockMfaOffered) {
+      throw mockApiError(
+        "http 403 for POST /api/auth/mfa/enroll",
+        403,
+        "the second factor is not enabled on this server"
+      );
+    }
     if (mockMfaActive) {
       throw mockApiError(
         "http 409 for POST /api/auth/mfa/enroll",
@@ -4556,6 +4577,13 @@ export const mockApi: Api = {
   },
 
   async activateMfa(password: string, code: string): Promise<void> {
+    if (!mockMfaOffered) {
+      throw mockApiError(
+        "http 403 for POST /api/auth/mfa/activate",
+        403,
+        "the second factor is not enabled on this server"
+      );
+    }
     if (mockMfaActive) {
       throw mockApiError(
         "http 409 for POST /api/auth/mfa/activate",
@@ -5770,6 +5798,7 @@ export function __resetMock(): void {
   taskManuals = [];
   mockPasswordSet = true;
   mockPassword = "mock-password";
+  mockMfaOffered = false;
   mockMfaActive = false;
   mockMfaPending = false;
   mockServerSettings = { ...DEFAULT_MOCK_SETTINGS };

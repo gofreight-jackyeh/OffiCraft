@@ -921,6 +921,18 @@ export interface AuthStatusView {
  * cannot be enrolled without it. The server never echoes an ACTIVE secret back,
  * so this view has no "read my current secret" counterpart, and it must not be
  * persisted anywhere by the cockpit. */
+/** The owner's second-factor state (`GET /api/auth/mfa`, owner-gated).
+ *
+ * `offered` is the ship-dark rollout flag — whether this server lets the factor
+ * be SET UP. It is NOT a second opinion on whether one is armed (`enrolled`),
+ * and it never affects whether login demands a code: withdrawing the feature
+ * leaves an armed factor fully enforced, or the flag would be a way for a stolen
+ * session to walk past it. */
+export interface MfaStateView {
+  offered: boolean;
+  enrolled: boolean;
+}
+
 export interface MfaEnrollView {
   /** Base32 secret, for manual entry into an authenticator app. */
   secret: string;

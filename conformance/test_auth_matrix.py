@@ -180,6 +180,28 @@ def _member_path(template: str):
     return build
 
 
+def _offer_mfa(ctx: Ctx) -> None:
+    """Turn the ship-dark feature flag ON — the precondition for enrol/activate.
+
+    Idempotent and inert: offering the factor arms nothing, so this cannot leave
+    a later login fixture needing a code.
+    """
+    ctx.client.post(
+        "/api/auth/mfa/offer",
+        json={"offered": True},
+        headers={"Authorization": f"Bearer {ctx.owner_token}"},
+    )
+
+
+def _mfa_enroll_path(ctx: Ctx, identity: str) -> str:
+    """The enroll row's path builder — it exists only to seed the feature flag
+    for the owner face, which would otherwise get a 403 instead of the 200 this
+    matrix pins."""
+    if identity == "owner":
+        _offer_mfa(ctx)
+    return "/api/auth/mfa/enroll"
+
+
 def _mfa_activate_body(ctx: Ctx, identity: str):
     """Body for the mfa/activate row, with its own precondition.
 
@@ -193,6 +215,7 @@ def _mfa_activate_body(ctx: Ctx, identity: str):
     later login fixture to trip over.
     """
     if identity == "owner":
+        _offer_mfa(ctx)
         ctx.client.post(
             "/api/auth/mfa/enroll",
             headers={"Authorization": f"Bearer {ctx.owner_token}"},
@@ -481,9 +504,21 @@ MATRIX: dict[str, Route] = {
     # states for its own row. enroll only ever writes an INERT pending secret
     # (nothing is armed until a code proves it), so every cell here sees the
     # same "no active factor" state no matter which ran first.
+    # The read is a plain owner-gated GET: no body, no state change.
+    "GET /api/auth/mfa": Route(requires="owner"),
+    # The ship-dark rollout flag. The owner face turns it ON, which is also the
+    # precondition the enroll row below needs — and leaving it on is harmless:
+    # offering the feature arms nothing, and every later login fixture in the run
+    # still needs no code because no factor is ever activated.
+    "POST /api/auth/mfa/offer": Route(
+        requires="owner",
+        body={"offered": True},
+    ),
     "POST /api/auth/mfa/enroll": Route(
         # Honest 200: a pending secret is inert. Nothing downstream is armed.
+        # The path builder seeds the feature flag for the owner face (403 without it).
         requires="owner",
+        path=_mfa_enroll_path,
     ),
     "POST /api/auth/mfa/activate": Route(
         # 401, and DETERMINISTICALLY so: the body callable enrols first for the

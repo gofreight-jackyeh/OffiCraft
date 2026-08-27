@@ -58,6 +58,10 @@ type apiServer struct {
 	// is what makes /api/login demand a second factor; totpLastStep is the
 	// replay floor (the highest step already spent). Both live under settingsMu
 	// with the rest of the auth snapshot — login reads them on every attempt.
+	// mfaOffered is the ship-dark feature flag (settings.go). It gates whether the
+	// factor can be SET UP; it is deliberately absent from every verification
+	// path, so withdrawing the feature can never disarm a live factor.
+	mfaOffered   bool
 	totpSecret   string
 	totpLastStep int64
 	// loginThrottle is the brute-force brake shared by every credential-guessing
@@ -423,6 +427,15 @@ func (s *apiServer) authPasswordHash() string {
 	s.settingsMu.RLock()
 	defer s.settingsMu.RUnlock()
 	return s.passwordHash
+}
+
+// authMFAOffered reports whether this server offers the second factor for
+// SET-UP. Never consult it when deciding whether to VERIFY a code — that is
+// driven by the presence of a secret and nothing else.
+func (s *apiServer) authMFAOffered() bool {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.mfaOffered
 }
 
 // authMFAEnrolled reports whether the second factor is armed.

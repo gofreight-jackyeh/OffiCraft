@@ -134,6 +134,8 @@ func t6020AllOpenedRows() map[[2]string]string {
 var t6020Withheld = [][2]string{
 	{"POST", "/api/mint"},
 	{"POST", "/api/auth/change-password"},
+	{"GET", "/api/auth/mfa"},
+	{"POST", "/api/auth/mfa/offer"},
 	{"POST", "/api/auth/mfa/enroll"},
 	{"POST", "/api/auth/mfa/activate"},
 	{"POST", "/api/auth/mfa/disable"},
@@ -277,10 +279,10 @@ func TestT6020WithheldRoutesStayOwnerOnlyAndOffTheMCPSurface(t *testing.T) {
 	// 7 from the original rulings + the 3 second-factor rows (see the table's
 	// note). The literal is kept so ADDING an owner-only row stays a deliberate
 	// act with a reason attached, which is the whole point of this file.
-	if len(t6020Withheld) != 10 {
-		t.Fatalf("this table must list 10 owner-only routes and lists %d — 7 from the "+
-			"owner rulings plus the 3 /api/auth/mfa/* rows added by the MFA change "+
-			"(see the note on the table). Do not read the 10 as an owner ruling: the "+
+	if len(t6020Withheld) != 12 {
+		t.Fatalf("this table must list 12 owner-only routes and lists %d — 7 from the "+
+			"owner rulings plus the 5 /api/auth/mfa* rows added by the MFA change "+
+			"(see the note on the table). Do not read the 12 as an owner ruling: the "+
 			"owner ruled on 7.", len(t6020Withheld))
 	}
 	index := t6020RouteIndex(t)

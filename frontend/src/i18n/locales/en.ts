@@ -637,6 +637,19 @@ export const en: Dict = {
     // ── second factor (TOTP) ──
     mfa: "Two-factor authentication",
     mfaSubOff: "Off — your password is the only key",
+    // The ship-dark rollout flag. Its own sentence because "the feature is not
+    // switched on for this server" and "you have not set it up" are different
+    // facts, and conflating them sends an owner looking for a button that is
+    // deliberately not there.
+    mfaSubUnavailable: "Not enabled on this server",
+    mfaOfferIntro:
+      "Two-factor is off for this server. Turn it on to let it be set up — this only makes the option available, it does not switch anything on for anyone.",
+    mfaOfferOn: "Enable two-factor for this server",
+    mfaOfferOff: "Disable the feature for this server",
+    // Said out loud because it is the whole safety property of the flag.
+    mfaOfferOffHint:
+      "This only hides the set-up option. A second factor that is already switched on keeps being required at sign-in, and can still be turned off above.",
+    mfaErrorOffer: "Could not change that setting",
     mfaSubOn: "On — an authenticator code is required to sign in",
     mfaIntro:
       "Add a code from your phone's authenticator app to every sign-in. Recommended if this server is reachable from outside your machine.",

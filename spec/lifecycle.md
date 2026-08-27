@@ -82,6 +82,18 @@ ceiling for non-warden agent-token mints.
   below it is refused, so a code cannot be replayed inside its own acceptance window.
   Verifying and advancing that floor MUST be one critical section, or two concurrent
   logins presenting the same code both pass.
+  - **Rollout flag.** `auth.mfa_offered` (default **false**, so an install that
+    upgrades into this build is unaffected until its owner opts in) decides
+    whether the factor may be SET UP: while it is false `…/enroll` and
+    `…/activate` MUST answer 403 and the cockpit hides the entry. It is read and
+    written by the owner-gated `GET /api/auth/mfa` / `POST /api/auth/mfa/offer`,
+    deliberately NOT by `GET /api/settings` (admin_agent floor + MCP tool — the
+    owner's credential posture is not an agent read path).
+    🔴 It MUST NOT gate verification. While a factor is armed, withdrawing the
+    feature leaves login demanding the code, `mfa_required` true, and `…/disable`
+    working. A flag that switched verification off would be a bypass: a stolen
+    owner token could withdraw the feature and walk past the factor that exists
+    to stop exactly that.
   - Arming is a two-step ceremony and BOTH steps are owner-gated: `POST /api/auth/mfa/enroll`
     writes an inert `auth.totp_pending_secret` and returns it once (the only moment a secret
     crosses the wire); `POST /api/auth/mfa/activate` MUST require the current **password**

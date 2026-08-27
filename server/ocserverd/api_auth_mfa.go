@@ -91,6 +91,61 @@ func (s *apiServer) verifyAndSpendTOTP(code string, now int64) (bool, error) {
 	return true, nil
 }
 
+// mfaNotOfferedMsg is the refusal when the feature has not been rolled out.
+// 403 (not 404): the route genuinely exists and the caller genuinely is the
+// owner — what is missing is the rollout decision, and pretending the endpoint
+// is absent would send whoever hits it hunting a deployment problem that is not
+// there.
+const mfaNotOfferedMsg = "the second factor is not enabled on this server"
+
+// GET /api/auth/mfa — owner-gated. The cockpit's read of the second-factor
+// state, and the ONLY read of the feature flag on the wire.
+//
+// Its own owner-gated route rather than a field on GET /api/settings, because
+// that route's floor is admin_agent and its GET is an MCP tool: the owner's
+// credential posture is not something to hand every agent in the office.
+// secret/otpauth_uri are always null — a secret is disclosed exactly once, by
+// enroll.
+func (s *apiServer) HandleMfaStateApiAuthMfaGet(w http.ResponseWriter, r *http.Request) {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	writeJSON(w, http.StatusOK, mfaStateDTO{
+		Offered:  s.mfaOffered,
+		Enrolled: s.totpSecret != "",
+	})
+}
+
+// POST /api/auth/mfa/offer — owner-gated. Flips the ship-dark feature flag.
+//
+// 🔴 A ROLLOUT SWITCH, NOT A SECURITY SWITCH. Turning it off is allowed while a
+// factor is armed and deliberately changes NOTHING about login: the code is
+// still demanded, /api/auth/status still reports mfa_required, and disable still
+// works. Letting it switch verification off would make the flag a bypass — a
+// stolen owner token could withdraw the feature and walk straight past the
+// factor that exists to stop it. Same argument as the both-factors rule on
+// disable, applied to the flag.
+//
+// Not throttled: it compares no secret, so there is nothing here to guess.
+func (s *apiServer) HandleMfaOfferApiAuthMfaOfferPost(w http.ResponseWriter, r *http.Request) {
+	var body MfaOfferDTO
+	if !decodeJSONBodyRequired(w, r, &body, "offered") {
+		return
+	}
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	// DB first, then the live snapshot — the ordering every settings write in
+	// this package uses.
+	if err := s.dal.PutSetting(settingMFAOffered, strconv.FormatBool(body.Offered)); err != nil {
+		internalError(w, err)
+		return
+	}
+	s.mfaOffered = body.Offered
+	writeJSON(w, http.StatusOK, mfaStateDTO{
+		Offered:  s.mfaOffered,
+		Enrolled: s.totpSecret != "",
+	})
+}
+
 // POST /api/auth/mfa/enroll — owner-gated. Mints a PENDING secret and returns
 // it once. Does not arm anything.
 func (s *apiServer) HandleMfaEnrollApiAuthMfaEnrollPost(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +153,10 @@ func (s *apiServer) HandleMfaEnrollApiAuthMfaEnrollPost(w http.ResponseWriter, r
 
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
+	if !s.mfaOffered {
+		writeError(w, http.StatusForbidden, mfaNotOfferedMsg)
+		return
+	}
 	if s.totpSecret != "" {
 		// Rotating an armed factor without proving the old one would make the
 		// factor worth exactly as much as the session — which is what it is
@@ -119,6 +178,7 @@ func (s *apiServer) HandleMfaEnrollApiAuthMfaEnrollPost(w http.ResponseWriter, r
 	}
 	uri := totpEnrollmentURI(secret, issuer, account)
 	writeJSON(w, http.StatusOK, mfaStateDTO{
+		Offered:    true, // gated above, so reaching here means the feature is on
 		Enrolled:   false,
 		Secret:     &secret,
 		OtpauthURI: &uri,
@@ -151,6 +211,10 @@ func (s *apiServer) HandleMfaActivateApiAuthMfaActivatePost(w http.ResponseWrite
 
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
+	if !s.mfaOffered {
+		writeError(w, http.StatusForbidden, mfaNotOfferedMsg)
+		return
+	}
 	if s.totpSecret != "" {
 		writeError(w, http.StatusConflict, "a second factor is already active")
 		return
@@ -219,7 +283,7 @@ func (s *apiServer) HandleMfaActivateApiAuthMfaActivatePost(w http.ResponseWrite
 	s.totpLastStep = step
 	s.loginThrottle.noteSuccess()
 
-	writeJSON(w, http.StatusOK, mfaStateDTO{Enrolled: true})
+	writeJSON(w, http.StatusOK, mfaStateDTO{Offered: true, Enrolled: true})
 }
 
 // POST /api/auth/mfa/disable — owner-gated, and additionally requires BOTH the
@@ -234,6 +298,10 @@ func (s *apiServer) HandleMfaActivateApiAuthMfaActivatePost(w http.ResponseWrite
 // mfa-disable` on the host, which substitutes proof of SHELL ACCESS for proof
 // of the factor — the same trust substitution the first-run claim token
 // already makes, not a new backdoor.
+// 🔴 DELIBERATELY NOT GATED ON mfaOffered. Withdrawing the feature must never
+// strand an owner with a factor they can no longer remove through the product:
+// the flag decides whether one may be SET UP, and taking the off-switch away
+// alongside the on-switch is the opposite of a rollout knob.
 func (s *apiServer) HandleMfaDisableApiAuthMfaDisablePost(w http.ResponseWriter, r *http.Request) {
 	var body MfaDisableDTO
 	if !decodeJSONBodyRequired(w, r, &body, "password", "code") {
@@ -287,5 +355,5 @@ func (s *apiServer) HandleMfaDisableApiAuthMfaDisablePost(w http.ResponseWriter,
 	s.totpLastStep = 0
 	s.loginThrottle.noteSuccess()
 
-	writeJSON(w, http.StatusOK, mfaStateDTO{Enrolled: false})
+	writeJSON(w, http.StatusOK, mfaStateDTO{Offered: s.mfaOffered, Enrolled: false})
 }

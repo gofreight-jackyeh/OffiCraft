@@ -67,9 +67,25 @@ func loginBody(password, code string) string {
 	return fmt.Sprintf(`{"password":%q,"code":%q}`, password, code)
 }
 
+// offerMFA turns the ship-dark feature flag on — the precondition for enrolling.
+// Everything about VERIFICATION is deliberately independent of it, which is what
+// TestMFAOfferedFlagNeverDisarmsALiveFactor exists to prove.
+func offerMFA(t *testing.T, api *apiServer, on bool) {
+	t.Helper()
+	rec := callJSON(api.HandleMfaOfferApiAuthMfaOfferPost,
+		fmt.Sprintf(`{"offered":%t}`, on))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("offer(%t): %d %s", on, rec.Code, rec.Body.String())
+	}
+	if decodeBody[mfaStateDTO](t, rec).Offered != on {
+		t.Fatalf("offer(%t) did not stick", on)
+	}
+}
+
 // armMFA enrols and activates a factor, returning the active secret.
 func armMFA(t *testing.T, api *apiServer) string {
 	t.Helper()
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enroll: %d %s", rec.Code, rec.Body.String())
@@ -177,6 +193,7 @@ func TestMFAEnrollRefusedWhileAFactorIsActive(t *testing.T) {
 
 func TestMFAActivateWithoutPendingIsAConflict(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaActivateApiAuthMfaActivatePost,
 		fmt.Sprintf(`{"password":%q,"code":"123456"}`, mfaTestPassword))
 	if rec.Code != http.StatusConflict {
@@ -188,6 +205,7 @@ func TestMFAActivateWithoutPendingIsAConflict(t *testing.T) {
 // QR scan, or owners learn to abandon the ceremony half-done.
 func TestMFAActivateWrongCodeKeepsThePendingSecret(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	secret := *decodeBody[mfaStateDTO](t, rec).Secret
 
@@ -282,6 +300,7 @@ func TestLoginRefusesAReplayedCode(t *testing.T) {
 // code stays live in anyone's scrollback for the rest of its window.
 func TestActivationCodeCannotBeReusedAsTheFirstLogin(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	secret := *decodeBody[mfaStateDTO](t, rec).Secret
 
@@ -539,6 +558,7 @@ func TestAuthStatusPublishesMFARequired(t *testing.T) {
 // out an existing enrolment and clone the factor.
 func TestActiveSecretIsNeverEchoedBack(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	secret := *decodeBody[mfaStateDTO](t, rec).Secret
 
@@ -769,6 +789,7 @@ func TestThrottleDecayClearsAStaleDeadline(t *testing.T) {
 // needs a live code) — a durable lockout from a transient theft.
 func TestMFAActivateRequiresThePassword(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	secret := *decodeBody[mfaStateDTO](t, rec).Secret
 
@@ -796,6 +817,7 @@ func TestMFAActivateRequiresThePassword(t *testing.T) {
 // password to someone holding only a session.
 func TestMFAActivateRefusalIsIndistinguishable(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	rec := callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")
 	secret := *decodeBody[mfaStateDTO](t, rec).Secret
 
@@ -816,6 +838,7 @@ func TestMFAActivateRefusalIsIndistinguishable(t *testing.T) {
 // status even when the budget is exhausted.
 func TestMFAActivateConflictsAreNotThrottled(t *testing.T) {
 	api := mfaAPI(t)
+	offerMFA(t, api, true)
 	for i := 0; i < throttleFreeFailures+2; i++ {
 		callJSON(api.HandleLoginApiLoginPost, loginBody("wrong", ""))
 	}
@@ -986,5 +1009,156 @@ func TestThrottleScheduleIsAbsolute(t *testing.T) {
 	// ~12 attempts an hour at the cap, stated as the arithmetic rather than as prose.
 	if perHour := int(time.Hour / throttleMaxDelay); perHour != 12 {
 		t.Errorf("attempts per hour at the cap = %d, want 12", perHour)
+	}
+}
+
+// ── the ship-dark feature flag ───────────────────────────────────────────────
+
+// TestMFADefaultsToNotOffered — the whole point of the flag: an install that
+// upgrades into this build must be completely unaffected until its owner opts
+// in. Nothing about login changes, and the set-up path is closed.
+func TestMFADefaultsToNotOffered(t *testing.T) {
+	api := mfaAPI(t)
+
+	if api.authMFAOffered() {
+		t.Fatal("a fresh install must NOT offer the second factor")
+	}
+	reloaded, err := loadAuthSettings(api.dal, Config{}, func(string) {})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.mfaOffered {
+		t.Error("an absent auth.mfa_offered row must load as false, not true")
+	}
+	// The set-up path is closed…
+	for _, tc := range []struct {
+		name string
+		rec  *httptest.ResponseRecorder
+	}{
+		{"enroll", callJSON(api.HandleMfaEnrollApiAuthMfaEnrollPost, "")},
+		{"activate", callJSON(api.HandleMfaActivateApiAuthMfaActivatePost,
+			fmt.Sprintf(`{"password":%q,"code":"123456"}`, mfaTestPassword))},
+	} {
+		if tc.rec.Code != http.StatusForbidden {
+			t.Errorf("%s while not offered = %d, want 403", tc.name, tc.rec.Code)
+		}
+	}
+	// …and login is byte-for-byte what it was before this feature existed.
+	if rec := callJSON(api.HandleLoginApiLoginPost, loginBody(mfaTestPassword, "")); rec.Code != http.StatusOK {
+		t.Errorf("password-only login on a dark install = %d, want 200", rec.Code)
+	}
+	req := httptest.NewRequest("GET", "/api/auth/status", nil)
+	rec := httptest.NewRecorder()
+	api.HandleAuthStatusApiAuthStatusGet(rec, req)
+	if decodeBody[authStatusDTO](t, rec).MFARequired {
+		t.Error("a dark install must report mfa_required: false")
+	}
+}
+
+// 🔴 TestMFAOfferedFlagNeverDisarmsALiveFactor is THE test for this flag.
+//
+// The flag is a rollout switch, not a security switch. If turning it off also
+// turned verification off, it would BE the bypass: anyone holding a stolen owner
+// token could withdraw the feature and walk straight past the second factor that
+// exists to stop exactly that — undoing the both-factors rule on disable in one
+// line. So: withdraw the feature from an ARMED install and assert that nothing
+// about verification moves.
+func TestMFAOfferedFlagNeverDisarmsALiveFactor(t *testing.T) {
+	api := mfaAPI(t)
+	secret := armMFA(t, api)
+
+	offerMFA(t, api, false) // withdraw the feature while a factor is armed
+
+	if !api.authMFAEnrolled() {
+		t.Fatal("withdrawing the feature disarmed the factor")
+	}
+	// The login wall must still be told to ask for a code — otherwise it hides
+	// the field while the server still demands one, and the owner is locked out.
+	rec := httptest.NewRecorder()
+	api.HandleAuthStatusApiAuthStatusGet(rec, httptest.NewRequest("GET", "/api/auth/status", nil))
+	if !decodeBody[authStatusDTO](t, rec).MFARequired {
+		t.Error("mfa_required went false while a factor is still armed — the wall " +
+			"would hide the code field and every login would fail with no way to see why")
+	}
+	// Password alone must still be refused.
+	if rec := callJSON(api.HandleLoginApiLoginPost, loginBody(mfaTestPassword, "")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("password-only login while the feature is withdrawn = %d, want 401 — "+
+			"the flag became a bypass", rec.Code)
+	}
+	// …and the code still works.
+	if rec := callJSON(api.HandleLoginApiLoginPost, loginBody(mfaTestPassword, nextCode(t, secret))); rec.Code != http.StatusOK {
+		t.Fatalf("two-factor login while the feature is withdrawn = %d, want 200", rec.Code)
+	}
+}
+
+// TestMFADisableWorksWhileTheFeatureIsWithdrawn — the other half of the same
+// rule. Taking the off-switch away alongside the on-switch would strand an owner
+// with a factor they can no longer remove through the product.
+func TestMFADisableWorksWhileTheFeatureIsWithdrawn(t *testing.T) {
+	api := mfaAPI(t)
+	secret := armMFA(t, api)
+	offerMFA(t, api, false)
+
+	rec := callJSON(api.HandleMfaDisableApiAuthMfaDisablePost,
+		fmt.Sprintf(`{"password":%q,"code":%q}`, mfaTestPassword, nextCode(t, secret)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable while the feature is withdrawn = %d %s", rec.Code, rec.Body.String())
+	}
+	if api.authMFAEnrolled() {
+		t.Error("factor still armed after a valid disable")
+	}
+}
+
+// TestMFAOfferSurvivesAReload — a rollout decision that forgets itself on
+// restart would silently re-hide the feature (or re-expose it).
+func TestMFAOfferSurvivesAReload(t *testing.T) {
+	api := mfaAPI(t)
+	offerMFA(t, api, true)
+
+	reloaded, err := loadAuthSettings(api.dal, Config{}, func(string) {})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.mfaOffered {
+		t.Fatal("the flag did not survive a reload")
+	}
+	offerMFA(t, api, false)
+	reloaded, err = loadAuthSettings(api.dal, Config{}, func(string) {})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.mfaOffered {
+		t.Error("turning the flag back off did not survive a reload")
+	}
+}
+
+// TestMFAStateReadsBothBits — the cockpit's one read, and it must never leak a
+// secret (that happens exactly once, at enroll).
+func TestMFAStateReadsBothBits(t *testing.T) {
+	api := mfaAPI(t)
+	get := func() mfaStateDTO {
+		rec := httptest.NewRecorder()
+		api.HandleMfaStateApiAuthMfaGet(rec, httptest.NewRequest("GET", "/api/auth/mfa", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/auth/mfa = %d", rec.Code)
+		}
+		return decodeBody[mfaStateDTO](t, rec)
+	}
+	if s := get(); s.Offered || s.Enrolled {
+		t.Fatalf("fresh install = %+v, want both false", s)
+	}
+	secret := armMFA(t, api)
+	s := get()
+	if !s.Offered || !s.Enrolled {
+		t.Errorf("after arming = %+v, want both true", s)
+	}
+	if s.Secret != nil || s.OtpauthURI != nil {
+		t.Error("the state read echoed a secret — it is disclosed only by enroll")
+	}
+	if rec := httptest.NewRecorder(); true {
+		api.HandleMfaStateApiAuthMfaGet(rec, httptest.NewRequest("GET", "/api/auth/mfa", nil))
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Errorf("the ACTIVE secret leaked into the state read: %s", rec.Body.String())
+		}
 	}
 }
