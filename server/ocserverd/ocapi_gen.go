@@ -395,8 +395,12 @@ type AliasUpdateDTO struct {
 // AuthStatusDTO First-run probe (`GET /api/auth/status`, PUBLIC): whether an owner password
 // has been set. The UI branches first-run setup vs login on this; /api/login
 // itself stays a flat 401 either way and never discloses the first-run state.
+//
+// `mfa_required` says whether the login wall must also collect a TOTP code. It is disclosed to an unauthenticated caller DELIBERATELY: the wall has to render the right number of fields before anyone has a token, and the alternative (a distinguishable "password ok, code missing" refusal) discloses strictly more — it confirms a correct password. What leaks here is one bit an attacker learns from a single login attempt anyway.
 type AuthStatusDTO struct {
-	PasswordSet bool `json:"password_set"`
+	// MfaRequired Whether an active TOTP secret is enrolled, i.e. whether `/api/login` demands a `code`. Optional for compatibility: a client that does not read it, or an older server that does not send it, behaves exactly as before.
+	MfaRequired *bool `json:"mfa_required,omitempty"`
+	PasswordSet bool  `json:"password_set"`
 }
 
 // BackupHealthDTO Whether the SCHEDULED database backup is still producing retreat points
@@ -1059,8 +1063,12 @@ type LessonsReplaceDTO struct {
 }
 
 // LoginDTO Owner login request: the password exchanged at `/api/login` for a JWT.
+//
+// `code` is the TOTP second factor, and it is OPTIONAL in the schema on purpose — it is required by SERVER STATE, not by the wire. While the owner has no TOTP secret enrolled it must be absent (or null) and is ignored; once enrolled, a login without it is a flat 401. Making it schema-required would break every existing client on an install that never turned MFA on.
 type LoginDTO struct {
-	Password string `json:"password"`
+	// Code TOTP code from the owner's authenticator app. Required only while MFA is enrolled (`GET /api/auth/status` → `mfa_required`). Separators are tolerated: "123 456" verifies the same as "123456".
+	Code     *string `json:"code,omitempty"`
+	Password string  `json:"password"`
 }
 
 // MachineClaimDTO Redeem a one-time machine claim code (“POST /api/machines/claim“).
@@ -1383,6 +1391,39 @@ type MemberUpdateDTO struct {
 
 	// Runtime Optional runtime replacement; null/omitted leaves the current runtime unchanged.
 	Runtime *AgentRuntime `json:"runtime,omitempty"`
+}
+
+// MfaActivateDTO Prove a pending TOTP enrolment and ARM the second factor (`POST /api/auth/mfa/activate`, owner-gated). The code must verify against the secret `…/mfa/enroll` handed out; on success that secret becomes the ACTIVE one and the second factor is armed from the next login onward. A wrong code or password leaves the pending secret in place so the owner can simply try again.
+//
+// 🔴 `password` IS REQUIRED, and the owner token alone is deliberately not enough. Arming a factor is as destructive as removing one: an attacker holding only a stolen owner token could otherwise enrol a secret THEY control and activate it, after which the real owner's password yields 401 and they cannot disable it (that needs a live code from the attacker's authenticator) — a transient token theft turned into a durable lockout recoverable only from a host shell. The same reasoning that makes `…/mfa/disable` demand both factors applies symmetrically to arming.
+type MfaActivateDTO struct {
+	// Code TOTP code generated from the pending secret. Separators are tolerated.
+	Code string `json:"code"`
+
+	// Password The current owner password. Re-proved here so a stolen session cannot arm a factor the owner does not hold.
+	Password string `json:"password"`
+}
+
+// MfaDisableDTO Turn the second factor off (`POST /api/auth/mfa/disable`, owner-gated). BOTH the current password and a live TOTP code are required: an owner-gated session alone must not be able to strip MFA, because the whole point of the factor is to survive a stolen session. An owner who has LOST their authenticator cannot satisfy this by design — that recovery path is the local `ocserverd mfa-disable` command, which proves host shell access instead.
+type MfaDisableDTO struct {
+	// Code Live TOTP code from the enrolled authenticator. Separators are tolerated.
+	Code     string `json:"code"`
+	Password string `json:"password"`
+}
+
+// MfaStateDTO The owner's second-factor state, answered by every `/api/auth/mfa/*` write.
+//
+// `enrolled` is the armed bit — true only once a pending secret has been PROVEN by `…/activate`.
+//
+// `secret` and `otpauth_uri` are non-null ONLY in the response to `…/enroll`, and only for the pending (not yet armed) secret. They are the one moment the secret crosses the wire, because an authenticator app cannot be enrolled without it; the server never echoes an ACTIVE secret back afterwards, so a stolen owner token cannot read out an existing enrolment and clone it.
+type MfaStateDTO struct {
+	Enrolled bool `json:"enrolled"`
+
+	// OtpauthUri The `otpauth://totp/…` URI for a pending enrolment (QR / deep-link form), else null.
+	OtpauthUri *string `json:"otpauth_uri"`
+
+	// Secret The base32 secret for a pending enrolment, for manual entry into an authenticator app; null otherwise.
+	Secret *string `json:"secret"`
 }
 
 // MintRequestDTO Owner-gated long-lived agent-token mint request (`POST /api/mint`).
@@ -3365,6 +3406,12 @@ type HandleIngestAgentContextApiAgentContextPostJSONRequestBody = AgentContextIn
 // HandleChangePasswordApiAuthChangePasswordPostJSONRequestBody defines body for HandleChangePasswordApiAuthChangePasswordPost for application/json ContentType.
 type HandleChangePasswordApiAuthChangePasswordPostJSONRequestBody = ChangePasswordDTO
 
+// HandleMfaActivateApiAuthMfaActivatePostJSONRequestBody defines body for HandleMfaActivateApiAuthMfaActivatePost for application/json ContentType.
+type HandleMfaActivateApiAuthMfaActivatePostJSONRequestBody = MfaActivateDTO
+
+// HandleMfaDisableApiAuthMfaDisablePostJSONRequestBody defines body for HandleMfaDisableApiAuthMfaDisablePost for application/json ContentType.
+type HandleMfaDisableApiAuthMfaDisablePostJSONRequestBody = MfaDisableDTO
+
 // HandleSetPasswordApiAuthSetPasswordPostJSONRequestBody defines body for HandleSetPasswordApiAuthSetPasswordPost for application/json ContentType.
 type HandleSetPasswordApiAuthSetPasswordPostJSONRequestBody = SetPasswordDTO
 
@@ -3624,6 +3671,15 @@ type ServerInterface interface {
 	// Change the owner password (verifies the current one).
 	// (POST /api/auth/change-password)
 	HandleChangePasswordApiAuthChangePasswordPost(w http.ResponseWriter, r *http.Request)
+	// Arm the second factor by proving a code from the pending secret.
+	// (POST /api/auth/mfa/activate)
+	HandleMfaActivateApiAuthMfaActivatePost(w http.ResponseWriter, r *http.Request)
+	// Turn the second factor off (password + live code required).
+	// (POST /api/auth/mfa/disable)
+	HandleMfaDisableApiAuthMfaDisablePost(w http.ResponseWriter, r *http.Request)
+	// Begin TOTP enrolment: mint a pending secret + otpauth URI.
+	// (POST /api/auth/mfa/enroll)
+	HandleMfaEnrollApiAuthMfaEnrollPost(w http.ResponseWriter, r *http.Request)
 	// First-run: set the owner password (one-shot claim token gate).
 	// (POST /api/auth/set-password)
 	HandleSetPasswordApiAuthSetPasswordPost(w http.ResponseWriter, r *http.Request)
@@ -3657,7 +3713,7 @@ type ServerInterface interface {
 	// List the chat stream (?with=<id>&limit=<n>; oldest→newest). History paging: before_ts + before_id (both together) return the limit messages strictly OLDER than that keyset cursor — a history page NEVER advances the read watermark. Re-read specific messages by id: ids=<id>&ids=<id> returns those messages in full without a peer and without a cursor; the ids schema states who may read what, the per-call limit, and what an unknown id does.
 	// (GET /api/chat)
 	HandleListChatApiChatGet(w http.ResponseWriter, r *http.Request, params HandleListChatApiChatGetParams)
-	// Post a chat message (sender = verified JWT sub; auto SSE fan-out). “to“ must name the owner or an active AI member; unknown, removed, and machine ids are rejected. Presence is not a gate: an offline member keeps its durable mailbox.
+	// Post a chat message (sender = verified JWT sub; auto SSE fan-out). ``to`` must name the owner or an active AI member; unknown, removed, and machine ids are rejected. Presence is not a gate: an offline member keeps its durable mailbox.
 	// (POST /api/chat)
 	HandlePostChatApiChatPost(w http.ResponseWriter, r *http.Request)
 	// Serve a chat attachment blob (owner-gated; raw bytes + stored mime).
@@ -3702,20 +3758,20 @@ type ServerInterface interface {
 	// COVERAGE: a syntactically valid `key` that simply has no retained versions yet is not an error — it returns an empty list, the honest 'nothing has been saved here', not a gap to work around.
 	// (GET /api/document-history/{kind}/{key})
 	HandleListDocumentHistoryApiDocumentHistoryKindKeyGet(w http.ResponseWriter, r *http.Request, kind string, key string)
-	// READ the SHIPPED DEFAULT of one editable document — the text a reset would put back, i.e. the 初始版本 entry of that document's version list. Read-only: this tool writes nothing, so reading the default can never replace the live document. Putting the default BACK is deliberately not an agent tool — the owner does that from the cockpit — exactly as with list_document_history. “content“ carries the SAME field names a retained version carries, so the same reader can compare a default against the live document.
+	// READ the SHIPPED DEFAULT of one editable document — the text a reset would put back, i.e. the 初始版本 entry of that document's version list. Read-only: this tool writes nothing, so reading the default can never replace the live document. Putting the default BACK is deliberately not an agent tool — the owner does that from the cockpit — exactly as with list_document_history. ``content`` carries the SAME field names a retained version carries, so the same reader can compare a default against the live document.
 	//
 	// WHICH DOCUMENTS THIS COVERS IS DELIBERATELY NOT LISTED HERE. A list of kinds written into a description goes stale the moment a new editable document ships and NOTHING turns red when it does — this one had gone wrong about three kinds before the list was taken out. Two rules you can actually execute replace it.
 	//
-	// ADDRESSING: “kind“ and “key“ name a document exactly as they do for list_document_history — the same server-side gate answers both routes, so whatever that tool addresses is addressable here, and a “kind“ this server does not know is refused with 400 while a “key“ that names no document of that kind is refused with 404 that names it. Neither is something to guess at: ask and read the answer.
+	// ADDRESSING: ``kind`` and ``key`` name a document exactly as they do for list_document_history — the same server-side gate answers both routes, so whatever that tool addresses is addressable here, and a ``kind`` this server does not know is refused with 400 while a ``key`` that names no document of that kind is refused with 404 that names it. Neither is something to guess at: ask and read the answer.
 	//
-	// COVERAGE: whether THAT document ships a default is answered by asking for it. 200 means it does, and “content“ is that text. 404 means it has none at all — a role the owner created, a task manual, per-role lessons — which is the same set whose reset the server also 404s, so it is the honest 'there is nothing to go back to', not a gap to work around. 400 on a retired kind names the series that replaced it.
+	// COVERAGE: whether THAT document ships a default is answered by asking for it. 200 means it does, and ``content`` is that text. 404 means it has none at all — a role the owner created, a task manual, per-role lessons — which is the same set whose reset the server also 404s, so it is the honest 'there is nothing to go back to', not a gap to work around. 400 on a retired kind names the series that replaced it.
 	// (GET /api/document-history/{kind}/{key}/seed)
 	HandleGetDocumentSeedApiDocumentHistoryKindKeySeedGet(w http.ResponseWriter, r *http.Request, kind string, key string)
-	// READ the BODY of one named retained version of an editable document — the “content“ map that version was stored with, exactly as it was stored. Read-only: this fetches text, it never puts it back; restoring stays out of the agent tool surface, as it does for list_document_history.
+	// READ the BODY of one named retained version of an editable document — the ``content`` map that version was stored with, exactly as it was stored. Read-only: this fetches text, it never puts it back; restoring stays out of the agent tool surface, as it does for list_document_history.
 	//
-	// THIS IS THE SECOND HALF OF A PAIR. list_document_history answers WHICH versions exist and how big each field of each one is, and carries no prose at all; this answers WHAT ONE OF THEM SAID. Name the “id“ you read off that list. Asking for every version's text is the cost that pairing exists to remove, so fetch the one you actually mean to read.
+	// THIS IS THE SECOND HALF OF A PAIR. list_document_history answers WHICH versions exist and how big each field of each one is, and carries no prose at all; this answers WHAT ONE OF THEM SAID. Name the ``id`` you read off that list. Asking for every version's text is the cost that pairing exists to remove, so fetch the one you actually mean to read.
 	//
-	// ADDRESSING: “kind“ and “key“ name a document exactly as they do for list_document_history — the same server-side gate answers all three routes, so whatever that tool can address, this one can too, and they can never silently disagree. A “kind“ this server does not know is refused with 400; a retired kind is refused with 400 naming the series that replaced it; a “key“ that fails its kind's required shape is refused with 400 naming the problem. An “id“ that is not a retained version of THAT document is a 404 — including an id that belongs to some other document, which is why the address is the whole triple and not the id alone.
+	// ADDRESSING: ``kind`` and ``key`` name a document exactly as they do for list_document_history — the same server-side gate answers all three routes, so whatever that tool can address, this one can too, and they can never silently disagree. A ``kind`` this server does not know is refused with 400; a retired kind is refused with 400 naming the series that replaced it; a ``key`` that fails its kind's required shape is refused with 400 naming the problem. An ``id`` that is not a retained version of THAT document is a 404 — including an id that belongs to some other document, which is why the address is the whole triple and not the id alone.
 	// (GET /api/document-history/{kind}/{key}/{id})
 	HandleGetDocumentVersionApiDocumentHistoryKindKeyIdGet(w http.ResponseWriter, r *http.Request, kind string, key string, id int64)
 	// Restore a retained document version as a new write.
@@ -4060,7 +4116,7 @@ type ServerInterface interface {
 	// Message the task's executor (owner/admin agent; task context auto-attached).
 	// (POST /api/tasks/{task_id}/message)
 	HandlePostTaskMessageApiTasksTaskIdMessagePost(w http.ResponseWriter, r *http.Request, taskId string)
-	// Submit/replace the workflow plan (done and answered-card steps are kept). T-74f8 交棒閘 (second door): a plan is a step-set write and the task status is DERIVED from the step set, so a plan that leaves EVERY step done CLOSES the task — the same irreversible close the final step report performs. If that task's creator is not its executor and no handover is declared or already real, the replan is refused with 422 BEFORE anything is written (the plan stays fully editable). A plan carries no handoff field, so the way out is to hand over first: create the successor task and point its “blocked_by“ at this task (the gate then stands aside by itself), or keep one unfinished step and declare the handover on the “update_step_status“ report that closes it. A replan that still leaves work in the plan is never gated. Answers with a bounded receipt (task_id, steps_total, progress_done, progress_total), not the plan you just sent — use get_task to read the stored step rows back.
+	// Submit/replace the workflow plan (done and answered-card steps are kept). T-74f8 交棒閘 (second door): a plan is a step-set write and the task status is DERIVED from the step set, so a plan that leaves EVERY step done CLOSES the task — the same irreversible close the final step report performs. If that task's creator is not its executor and no handover is declared or already real, the replan is refused with 422 BEFORE anything is written (the plan stays fully editable). A plan carries no handoff field, so the way out is to hand over first: create the successor task and point its ``blocked_by`` at this task (the gate then stands aside by itself), or keep one unfinished step and declare the handover on the ``update_step_status`` report that closes it. A replan that still leaves work in the plan is never gated. Answers with a bounded receipt (task_id, steps_total, progress_done, progress_total), not the plan you just sent — use get_task to read the stored step rows back.
 	// (POST /api/tasks/{task_id}/plan)
 	HandleSubmitTaskPlanApiTasksTaskIdPlanPost(w http.ResponseWriter, r *http.Request, taskId string)
 	// Set a task's priority (owner/admin agent any value on any task; the task's own executor any value on their task — frozen INCLUDED, and whoever may freeze may unfreeze, T-6020). The actor who sets frozen is recorded on the task as frozen_by and the field clears when the task leaves frozen. Anyone else is a flat 403. Answers with a bounded receipt (task_id, priority, frozen_by), not the whole task — use get_task when you need the rest.
@@ -4193,6 +4249,48 @@ func (siw *ServerInterfaceWrapper) HandleChangePasswordApiAuthChangePasswordPost
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.HandleChangePasswordApiAuthChangePasswordPost(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// HandleMfaActivateApiAuthMfaActivatePost operation middleware
+func (siw *ServerInterfaceWrapper) HandleMfaActivateApiAuthMfaActivatePost(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.HandleMfaActivateApiAuthMfaActivatePost(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// HandleMfaDisableApiAuthMfaDisablePost operation middleware
+func (siw *ServerInterfaceWrapper) HandleMfaDisableApiAuthMfaDisablePost(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.HandleMfaDisableApiAuthMfaDisablePost(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// HandleMfaEnrollApiAuthMfaEnrollPost operation middleware
+func (siw *ServerInterfaceWrapper) HandleMfaEnrollApiAuthMfaEnrollPost(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.HandleMfaEnrollApiAuthMfaEnrollPost(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -8288,6 +8386,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/agent/binary", wrapper.HandleAgentBinaryApiAgentBinaryGet)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/agent/context", wrapper.HandleIngestAgentContextApiAgentContextPost)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/auth/change-password", wrapper.HandleChangePasswordApiAuthChangePasswordPost)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/auth/mfa/activate", wrapper.HandleMfaActivateApiAuthMfaActivatePost)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/auth/mfa/disable", wrapper.HandleMfaDisableApiAuthMfaDisablePost)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/auth/mfa/enroll", wrapper.HandleMfaEnrollApiAuthMfaEnrollPost)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/auth/set-password", wrapper.HandleSetPasswordApiAuthSetPasswordPost)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/auth/status", wrapper.HandleAuthStatusApiAuthStatusGet)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/backup-health", wrapper.HandleGetBackupHealthApiBackupHealthGet)

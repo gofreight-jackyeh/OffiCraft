@@ -28,9 +28,13 @@ is still asserted and a semantic ``check`` replaces schema validation.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import pathlib
+import struct
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -58,6 +62,56 @@ _PNG_BYTES = base64.b64decode(_PNG_B64)
 
 def _auth(token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+# ── TOTP, computed here from the RFC rather than from the server's code ───────
+# 🔴 THIS IS THE INTEROP PROOF, and it is why it is hand-rolled from stdlib
+# instead of imported: this suite is a language-agnostic BLACK BOX (the run
+# script greps for server imports and fails if it finds any). A code computed
+# independently from RFC 6238 — HMAC-SHA1, 6 digits, 30s step, the triple every
+# authenticator app implements — verifying against this server is the only
+# evidence in the tree that a real phone will work. Reusing the server's own
+# helper would prove the server agrees with itself.
+_TOTP_STEP = 30
+_TOTP_DIGITS = 6
+
+
+def _totp_key(secret: str) -> bytes:
+    """Decode a base32 TOTP secret the way an authenticator does (unpadded,
+    case-insensitive). Raises on anything an app could not consume."""
+    cleaned = secret.strip().replace(" ", "").replace("-", "").upper()
+    pad = "=" * (-len(cleaned) % 8)
+    key = base64.b32decode(cleaned + pad)
+    assert key, f"empty TOTP key from {secret!r}"
+    return key
+
+
+def _totp_align_to_step_start(min_headroom: float = 12.0) -> None:
+    """Wait out the tail of the current 30s step when little of it is left.
+
+    🔴 WHY THE CEREMONY NEEDS THIS. The server accepts a code from the current
+    step ±1 — exactly THREE steps at any instant — and it SPENDS each step it
+    accepts (single-use codes). A ceremony with three code-consuming operations
+    (activate, login, disable) therefore needs all three slots, and they only
+    stay valid if the window does not slide mid-test. Starting 2s before a step
+    boundary would move the window under us and invalidate the earliest slot.
+    Waiting a few seconds is far cheaper (and far less flaky) than sleeping a
+    whole step between operations.
+    """
+    remaining = _TOTP_STEP - (time.time() % _TOTP_STEP)
+    if remaining < min_headroom:
+        time.sleep(remaining + 0.5)
+
+
+def _totp_code(secret: str, at: float | None = None, step_offset: int = 0) -> str:
+    """RFC 6238 code. ``step_offset`` shifts by whole 30s steps — needed because
+    the server SPENDS each step it accepts (replay defence), so the code that
+    armed the factor cannot also open a session."""
+    counter = int((at if at is not None else time.time()) // _TOTP_STEP) + step_offset
+    digest = hmac.new(_totp_key(secret), struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    truncated = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(truncated % (10 ** _TOTP_DIGITS)).zfill(_TOTP_DIGITS)
 
 
 @dataclass
@@ -151,6 +205,19 @@ def _check_version(_ctx: HCtx, r: httpx.Response) -> None:
 def _check_login(_ctx: HCtx, r: httpx.Response) -> None:
     data = r.json()
     assert data["token"] and data["token_type"] == "bearer", data
+
+
+def _check_mfa_enroll(_ctx: HCtx, r: httpx.Response) -> None:
+    data = r.json()
+    # enroll hands back a usable secret AND must NOT claim the factor is armed:
+    # a UI that trusted `enrolled` here would tell the owner they are protected
+    # while the next login still takes the password alone.
+    assert data["enrolled"] is False, data
+    assert data["secret"], data
+    assert data["otpauth_uri"].startswith("otpauth://totp/"), data
+    # The secret must be decodable base32 — an authenticator cannot use anything
+    # else, and a malformed one fails only later, on the phone.
+    _totp_key(data["secret"])
 
 
 def _check_install_sh(_ctx: HCtx, r: httpx.Response) -> None:
@@ -907,6 +974,17 @@ HAPPY: dict[str, Happy] = {
         body=lambda _ctx: {"password": os.environ["OC_OWNER_PASSWORD"]},
         check=_check_login,
     ),
+    # ── owner second factor (TOTP) ───────────────────────────────────────────
+    # enroll is a REAL happy face: it mints an INERT pending secret (nothing is
+    # armed until a code proves it), so it neither needs setup nor leaves the
+    # shared credential changed.
+    #
+    # activate / disable are NOT in this table — their positive faces would ARM
+    # a factor on the shared install, after which every later login fixture in
+    # the run would need a TOTP code. The full ceremony is exercised instead by
+    # test_mfa_full_ceremony below, which arms AND disarms inside one test so
+    # the install is left exactly as it was found.
+    "POST /api/auth/mfa/enroll": Happy(check=_check_mfa_enroll),
     "GET /install.sh": Happy(
         identity="none",
         path="/install.sh?token=conf-happy-boot-token",
@@ -2030,6 +2108,18 @@ SKIPPED_HAPPY: dict[str, str] = {
         "the auth matrix; the full change/revocation semantics in the server "
         "unit tests (api_settings_test.go)."
     ),
+    "POST /api/auth/mfa/activate": (
+        "the positive face ARMS the owner's second factor on the shared install, "
+        "after which every later login fixture in the run would need a TOTP code. "
+        "Exercised end-to-end by test_mfa_full_ceremony below, which arms and "
+        "then disarms inside one test so the install is left as found; the 409 "
+        "and 401 faces are pinned in the auth matrix."
+    ),
+    "POST /api/auth/mfa/disable": (
+        "the positive face needs an ARMED factor (see above) plus a live code. "
+        "Exercised by test_mfa_full_ceremony below; its nothing-armed 409 face is "
+        "pinned in the auth matrix."
+    ),
     "GET /api/events": (
         "SSE stream, not a JSON response — behaviour contract lives in "
         "spec/sse.md; the auth matrix probes its status face."
@@ -2500,6 +2590,174 @@ def test_share_sig_never_shadows_a_bad_bearer(hctx: HCtx) -> None:
     assert r.status_code == 401, f"bad bearer + good sig must 401, got {r.status_code}"
     r = hctx.client.get(f"/api/chat/attachment/{att_id}?token=not-a-jwt&sig={sig}")
     assert r.status_code == 401, f"bad ?token= + good sig must 401, got {r.status_code}"
+
+
+# ── owner second factor: the whole ceremony, over the real wire ──────────────
+
+
+def test_mfa_full_ceremony(hctx: HCtx) -> None:
+    """enroll → activate → login-with-code → replay refused → disable.
+
+    🔴 SELF-CLEANING BY CONSTRUCTION. This test ARMS the owner's second factor
+    on the shared install, so it MUST disarm it again — while it is armed, every
+    /api/login in the run needs a code. The disable is therefore not an
+    afterthought assertion but the thing that keeps the rest of the suite
+    honest, and the finally block guarantees it runs even when an assertion
+    above it fails. That is also why the positive activate/disable faces are not
+    ordinary HAPPY rows: a table row cannot guarantee its own cleanup.
+
+    The codes are computed independently from RFC 6238 (see _totp_code) — this
+    is the suite's proof that an ordinary authenticator app interoperates.
+
+    🔴 IT ALSO DEPENDS ON THE SHARED CREDENTIAL BUDGET, and that dependency is
+    real rather than theoretical — say it out loud so the next person adding a
+    negative-credential assertion here knows what they are spending.
+
+    The server's attempt brake is ONE process-wide bucket cleared only by a
+    success, and this test deliberately provokes several refusals. Each
+    successful step in the ceremony (activate, then the two-factor login) clears
+    it, which is what leaves headroom; the run currently ends with three
+    failures before the disable, against a free allowance of
+    throttleFreeFailures. Exceed it and the `finally` disable itself answers 429,
+    which leaves the factor ARMED and cascades into every later login fixture in
+    the run — a failure that surfaces far away from its cause. A previous version
+    of this test did exactly that, and an earlier still one throttled itself by
+    retrying disable with codes outside the acceptance window.
+
+    So: if you add a refusal here, add it BEFORE a step that succeeds, not after
+    the last one.
+    """
+    owner = _auth(hctx.owner_token)
+    password = os.environ["OC_OWNER_PASSWORD"]
+
+    # 🔴 THE STEP BUDGET. Codes are single-use (the server advances a replay
+    # floor past every step it accepts) and only the current step ±1 is ever
+    # accepted — three slots, and this ceremony consumes exactly three:
+    #
+    #   activate → step-1     login → step+0     disable → step+1
+    #
+    # They MUST be strictly increasing (each must clear the floor the previous
+    # one left) and all three must stay inside the window, which is why the run
+    # aligns to a fresh step first. This is real product behaviour, not a test
+    # trick: an owner who logs in and immediately disables MFA must also wait
+    # for their authenticator to roll over to a code they have not spent.
+    _totp_align_to_step_start()
+
+    # ── enroll: an INERT pending secret ──────────────────────────────────────
+    r = hctx.client.post("/api/auth/mfa/enroll", headers=owner)
+    assert r.status_code == 200, f"{r.status_code} {r.text}"
+    enrolled = r.json()
+    secret = enrolled["secret"]
+    assert enrolled["enrolled"] is False, "enroll must not arm the factor"
+
+    # Nothing is armed yet, so the public probe must still say so and a
+    # password-only login must still work.
+    probe = hctx.client.get("/api/auth/status").json()
+    assert probe["mfa_required"] is False, probe
+    assert (
+        hctx.client.post("/api/login", json={"password": password}).status_code == 200
+    ), "a pending (unproven) secret must not gate login"
+
+    # 🔴 The owner token alone must NOT be able to arm a factor. A stolen token
+    # could otherwise enrol a secret the attacker controls and activate it,
+    # leaving the real owner locked out until someone runs `ocserverd
+    # mfa-disable` on the host — strictly worse than the pre-MFA baseline.
+    r = hctx.client.post(
+        "/api/auth/mfa/activate",
+        json={"password": "conf-definitely-wrong", "code": _totp_code(secret, step_offset=-1)},
+        headers=owner,
+    )
+    assert r.status_code == 401, f"activate with a wrong password: {r.status_code} {r.text}"
+    assert (
+        hctx.client.get("/api/auth/status").json()["mfa_required"] is False
+    ), "a factor was armed WITHOUT the password"
+
+    armed = False
+    try:
+        # ── activate: prove a code, arming the factor ────────────────────────
+        activation_code = _totp_code(secret, step_offset=-1)
+        r = hctx.client.post(
+            "/api/auth/mfa/activate",
+            json={"password": password, "code": activation_code},
+            headers=owner,
+        )
+        assert r.status_code == 200, f"activate: {r.status_code} {r.text}"
+        armed = True
+        assert r.json()["enrolled"] is True
+        # The ACTIVE secret must never be echoed back — otherwise a stolen owner
+        # token could read out the enrolment and clone the factor.
+        assert r.json()["secret"] is None, r.json()
+        assert r.json()["otpauth_uri"] is None, r.json()
+
+        # The public probe now tells the login wall to render a code field.
+        assert hctx.client.get("/api/auth/status").json()["mfa_required"] is True
+
+        # ── login now REQUIRES the code ─────────────────────────────────────
+        assert (
+            hctx.client.post("/api/login", json={"password": password}).status_code
+            == 401
+        ), "password alone must not log in while a factor is armed"
+
+        # The next slot up: activation SPENT step-1, so the code that armed the
+        # factor cannot also open a session.
+        login_code = _totp_code(secret, step_offset=0)
+        r = hctx.client.post(
+            "/api/login", json={"password": password, "code": login_code}
+        )
+        assert r.status_code == 200, f"two-factor login: {r.status_code} {r.text}"
+        assert r.json()["token"], r.json()
+
+        # ── the replay guard: that same code must not work twice ─────────────
+        r = hctx.client.post(
+            "/api/login", json={"password": password, "code": login_code}
+        )
+        assert r.status_code == 401, (
+            f"a REPLAYED code logged in again ({r.status_code}) — the single-use "
+            "floor is not holding"
+        )
+
+        # A wrong password with a right code is refused the same way, and the
+        # refusal must not disclose WHICH half failed.
+        # A failed login does NOT spend the step (the password is checked first
+        # and short-circuits), so borrowing the disable slot here is safe.
+        wrong_pwd = hctx.client.post(
+            "/api/login",
+            json={
+                "password": "conf-definitely-wrong",
+                "code": _totp_code(secret, step_offset=1),
+            },
+        )
+        wrong_code = hctx.client.post(
+            "/api/login", json={"password": password, "code": "000000"}
+        )
+        assert wrong_pwd.status_code == wrong_code.status_code == 401
+        assert wrong_pwd.json() == wrong_code.json(), (
+            "the refusal distinguishes a wrong password from a wrong code, which "
+            f"confirms a correct password: {wrong_pwd.json()} vs {wrong_code.json()}"
+        )
+    finally:
+        if armed:
+            # Disarm with BOTH factors, using the LAST unspent slot in the
+            # window (+1). No retry loop: a loop over offsets outside the ±1
+            # window can only fail, and each failure spends from the shared
+            # credential-attempt budget — which is how an earlier version of
+            # this test throttled ITSELF into a 429 instead of disarming.
+            r = hctx.client.post(
+                "/api/auth/mfa/disable",
+                json={"password": password, "code": _totp_code(secret, step_offset=1)},
+                headers=owner,
+            )
+            assert r.status_code == 200, f"disable: {r.status_code} {r.text}"
+            assert r.json()["enrolled"] is False
+            # The install must be left EXACTLY as found, or every later login
+            # fixture in this run breaks.
+            assert hctx.client.get("/api/auth/status").json()["mfa_required"] is False
+            assert (
+                hctx.client.post(
+                    "/api/login", json={"password": password}
+                ).status_code
+                == 200
+            ), "password-only login must work again after the factor is removed"
 
 
 # ── coverage teeth ───────────────────────────────────────────────────────────

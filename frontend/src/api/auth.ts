@@ -5,6 +5,8 @@
 // mints — a wrong password yields a 401 and we throw, never fabricating a
 // token. The /api/login endpoint is PUBLIC, so we send NO Authorization here.
 
+import { ApiError, parseRetryAfter } from "./errors";
+
 export const TOKEN_KEY = "oc_token";
 
 /** Fired on the window the instant an owner token is minted (login /
@@ -75,14 +77,40 @@ export function clearToken(): void {
  * failure, never bounce an auth-expired event). The bare fetch is the honest
  * shape for the one call that mints the token everything else rides on.
  */
-export async function login(password: string): Promise<void> {
+export async function login(password: string, code?: string): Promise<void> {
   const res = await fetch("/api/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    // `code` is OMITTED entirely when absent rather than sent as null/"" —
+    // LoginDTO is additionalProperties:false and the field is optional, so the
+    // absent form is the one an install without MFA has always spoken.
+    body: JSON.stringify(code ? { password, code } : { password }),
   });
   if (!res.ok) {
-    throw new Error(`login failed: http ${res.status}`);
+    // Throws ApiError, not a bare Error: the wall has to tell a WRONG
+    // CREDENTIAL (401) apart from the attempt brake (429 + Retry-After), and
+    // telling an owner "wrong password" while they are merely rate-limited
+    // sends them hunting a typo that does not exist.
+    // Named errCode, NOT code — `code` is this function's TOTP parameter, and
+    // shadowing it here would be a trap for the next reader.
+    let errCode = "";
+    let serverMessage = "";
+    try {
+      const parsed: unknown = await res.json();
+      const err = (parsed as { error?: { code?: unknown; message?: unknown } })
+        ?.error;
+      if (typeof err?.code === "string") errCode = err.code;
+      if (typeof err?.message === "string") serverMessage = err.message;
+    } catch {
+      // Not JSON — keep the honest empties.
+    }
+    throw new ApiError(
+      `login failed: http ${res.status}`,
+      res.status,
+      errCode,
+      serverMessage,
+      parseRetryAfter(res.headers.get("Retry-After")),
+    );
   }
   const data = (await res.json()) as { token: string };
   setToken(data.token);

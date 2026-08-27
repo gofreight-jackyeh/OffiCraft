@@ -517,6 +517,25 @@ export const zh = {
     submit: "登入",
     submitting: "登入中…",
     error: "密碼錯誤，請再試一次",
+    // 刻意同時點出兩個欄位:server 對「密碼錯」與「驗證碼錯」回同一個 401,
+    // 因為指名是哪一半錯,等於向只猜對一半的人確認密碼是對的。
+    // 所以登入牆也無從得知 — 不該假裝知道。
+    errorWithCode: "密碼或驗證碼錯誤，請再試一次",
+    codePlaceholder: "6 位數驗證碼",
+    codeHint: "來自你的驗證器 App",
+    // 429 + Retry-After:這是嘗試次數的煞車,不是密碼錯。
+    //
+    // 用 lead/tail 靜態葉子、由 i18n/compose.ts 組裝 —— 不在 dictionary 直接放
+    // interpolation function。theming-and-i18n.md 禁止後者,理由不是美觀而是
+    // 「看不見」:message key 白名單只收 string leaf,所以 template function 裡
+    // 的每一個字都無法被主題的 wording 覆寫、也不會出現在生成的 key 清單裡,
+    // 於是 drift 閘門一路綠燈,而那句話其實永遠改不動。
+    throttledLead: "失敗次數過多，請於",
+    throttledTail: "秒後再試。",
+    // 當一次被拒的登入其實是「少了驗證碼」而不是「密碼錯」時顯示 —— 也就是這面
+    // 牆本來是過期的、剛剛才長出驗證碼欄位。必須解釋欄位為什麼突然出現，否則
+    // owner 會讀成密碼錯了。
+    codeNowRequired: "這台 server 現在需要驗證碼，請輸入驗證器 App 顯示的那一組。",
   },
   // 首設密碼(全新安裝第一次打開座艙;啟用碼 = server 啟動訊息印出的一次性
   // claim token,證明你是這台機器的主人)。
@@ -690,6 +709,41 @@ export const zh = {
     pwdErrorCurrent: "目前密碼不對",
     pwdErrorTooShort: "新密碼至少要 8 個字",
     pwdErrorMismatch: "兩次輸入的新密碼不一樣",
+    // 共用憑證嘗試煞車回的 429。少了這個分支會顯示成「目前密碼不對」,於是
+    // 剛才登入打錯幾次的 owner 會被告知他正確的密碼是錯的,最長五分鐘。
+    pwdErrorThrottled: "失敗次數過多 — 請稍候再試",
+    // ── 第二因子(TOTP) ──
+    mfa: "兩步驟驗證",
+    mfaSubOff: "未開啟 — 你的密碼是唯一的鑰匙",
+    mfaSubOn: "已開啟 — 登入時需要驗證器的驗證碼",
+    mfaIntro:
+      "每次登入都要再輸入一次手機驗證器 App 的驗證碼。如果這台 server 可以從外部連進來，建議開啟。",
+    mfaEnrollStart: "設定兩步驟驗證",
+    mfaEnrollStarting: "準備中…",
+    mfaScanHint: "把這組金鑰加進驗證器 App，然後輸入它顯示的驗證碼來確認。",
+    mfaSecretLabel: "設定金鑰",
+    mfaOpenInApp: "用驗證器 App 開啟",
+    mfaCodePlaceholder: "6 位數驗證碼",
+    // 啟用時要重新驗密碼:裝上一個因子和移除它一樣具破壞性,被偷的 session
+    // 不該做得到。
+    mfaActivateHint: "請輸入密碼與驗證器顯示的驗證碼來確認。",
+    mfaErrorActivate: "密碼或驗證碼錯誤",
+    // 這種 401 其實是 session 死了、不是憑證錯。這些表單刻意不在 401 時彈回
+    // 登入牆(憑證錯必須留在原地當 inline error),所以過期要明講。
+    mfaErrorSession: "登入階段已過期，請重新登入",
+    mfaActivate: "確認並開啟",
+    mfaActivating: "確認中…",
+    mfaActivated: "兩步驟驗證已開啟",
+    mfaDisable: "關閉兩步驟驗證",
+    mfaDisableHint:
+      "需要密碼和目前的驗證碼。如果驗證器已經遺失，請改在這台機器上執行 `ocserverd mfa-disable`。",
+    mfaDisabling: "關閉中…",
+    mfaDisabled: "兩步驟驗證已關閉",
+    mfaErrorDisable: "密碼或驗證碼錯誤",
+    // 與「驗證碼錯」是不同的失敗:這裡是根本讀不到目前狀態,所以不知道該給
+    // 什麼選項。用「驗證碼錯誤」會指涉一組 owner 根本沒送出的驗證碼。
+    mfaErrorLoad: "讀不到兩步驟驗證的狀態",
+    mfaRetry: "重試",
   },
   chat: {
     offlineTitleSuffix: "目前離線",

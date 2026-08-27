@@ -15,14 +15,43 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly serverMessage: string;
+  /** Seconds from a 429's `Retry-After` header; null when absent/unparseable.
+   *
+   * Carried as a FIELD rather than parsed out of `serverMessage` at the point
+   * of use: the wait is a machine-readable header, and scraping it back out of
+   * prose would break the moment that prose is reworded or localised. */
+  readonly retryAfter: number | null;
 
-  constructor(message: string, status: number, code: string, serverMessage: string) {
+  constructor(
+    message: string,
+    status: number,
+    code: string,
+    serverMessage: string,
+    retryAfter: number | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.serverMessage = serverMessage;
+    this.retryAfter = retryAfter;
   }
+}
+
+/** How long a 429 says to wait, in whole seconds. Falls back to 1 rather than 0
+ * when the header is missing or junk: "retry in 0s" reads as "go ahead now",
+ * which is the one thing a throttle must never say. */
+export function retryAfterSeconds(e: unknown): number {
+  const raw = e instanceof ApiError ? e.retryAfter : null;
+  return raw !== null && Number.isFinite(raw) && raw > 0 ? Math.ceil(raw) : 1;
+}
+
+/** Parse a `Retry-After` header value (delta-seconds form). null when absent or
+ * not a positive number — the HTTP-date form is not used by this server. */
+export function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const secs = Number(header.trim());
+  return Number.isFinite(secs) && secs > 0 ? secs : null;
 }
 
 /** The server's human-readable REASON for a rejection, or `""` when there is

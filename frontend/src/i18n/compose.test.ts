@@ -30,6 +30,12 @@ const EVERY_FIVE = Array.from({ length: 12 }, (_, i) => i * 5);
 
 /** [language, message, arguments, the text that must appear on screen]. */
 const EXPECTED: [Lang, string, (string | number | string[] | number[])[], string][] = [
+    // The 429 credential brake. Pinned in BOTH languages because the space
+    // after the number is language-specific and is the opposite of `sp`: zh
+    // wants it, en does not. Getting that backwards yields "請於 42秒後再試。"
+    // or "in 42 s." — which typecheck and the drift gate both accept happily.
+    ["zh", "loginThrottled", [42], "失敗次數過多，請於 42 秒後再試。"],
+    ["en", "loginThrottled", [42], "Too many failed attempts. Try again in 42s."],
     ["zh", "taskProgress", [3,7], "步驟 3/7"],
     ["zh", "taskElapsed", ["2 小時"], "已歷時 2 小時"],
     ["zh", "taskPlanningBy", ["Mira"], "等待 Mira 建立 Steps"],

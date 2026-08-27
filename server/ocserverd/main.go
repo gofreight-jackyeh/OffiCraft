@@ -24,6 +24,7 @@ var subcommands = []struct{ name, help string }{
 	{"backup", "take one online snapshot of this instance's database (single consistent file)"},
 	{"set-password", "store the owner password's argon2id hash in DB settings ($OC_NEW_PASSWORD)"},
 	{"claim-token", "print the one-shot first-run claim code (exit 3 once a password is set)"},
+	{"mfa-disable", "clear the owner's TOTP second factor (lost-authenticator recovery)"},
 }
 
 func usage(out io.Writer) {
@@ -94,6 +95,13 @@ func realMain(argv []string, env func(string) string, out io.Writer) int {
 			return 2
 		}
 		return cmdClaimToken(env, out)
+
+	case "mfa-disable":
+		if len(rest) != 0 {
+			fmt.Fprintln(out, "[ocserverd] mfa-disable takes no arguments (the database comes from the resolved DSN)")
+			return 2
+		}
+		return cmdMFADisable(env, out)
 
 	case "-h", "--help", "help":
 		usage(out)

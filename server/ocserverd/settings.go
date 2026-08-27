@@ -48,6 +48,24 @@ const (
 	// deleted on success (possession proves host shell access — the gate
 	// against a public-tunnel visitor claiming a fresh server).
 	settingClaimToken = "auth.claim_token"
+	// The owner's TOTP second factor (totp.go). Three keys, because enrolment
+	// is a two-step ceremony and replay defence needs a floor:
+	//
+	//   settingTOTPSecret — the ACTIVE base32 secret. Present ⇒ MFA is on and
+	//     /api/login demands a code. This is the single bit that arms the second
+	//     factor; there is deliberately no separate "mfa_enabled" flag that
+	//     could disagree with the presence of a usable secret.
+	//   settingTOTPPendingSecret — a minted-but-unproven secret, written by
+	//     enroll and consumed by activate. It exists so a secret can NEVER be
+	//     promoted to active until the owner has produced a working code from
+	//     it: enrolling into the active slot directly would let a mistyped QR
+	//     scan lock the owner out of their own server on the next login.
+	//   settingTOTPLastStep — the highest RFC 6238 time step already spent.
+	//     A code stays valid across the acceptance window, so without this
+	//     floor the same six digits replay for ~90 seconds.
+	settingTOTPSecret        = "auth.totp_secret"
+	settingTOTPPendingSecret = "auth.totp_pending_secret"
+	settingTOTPLastStep      = "auth.totp_last_step"
 	// ctx.* mirror the SseContextHighConfig knobs (defaults in
 	// defaultSseContextHigh; only handover_pct gets UI in B3).
 	//
@@ -245,6 +263,8 @@ type authSettings struct {
 	secret                       []byte
 	passwordHash                 string // "" = not set in DB (first-run: set-password flow)
 	passwordChangedAt            int64  // epoch secs; owner tokens with iat before it are refused
+	totpSecret                   string // "" = MFA off; non-empty ⇒ /api/login demands a TOTP code
+	totpLastStep                 int64  // highest TOTP step already spent (replay floor)
 	ownerTokenTTL                int64
 	agentTokenTTL                int64
 	ctxhigh                      SseContextHighConfig
@@ -347,6 +367,35 @@ func loadAuthSettings(d *DAL, cfg Config, logf func(string)) (authSettings, erro
 		}
 		out.passwordHash = phc
 		logf("migrated oc.toml [auth].password into DB settings as an argon2id hash")
+	}
+
+	// The active TOTP secret. A stored value that does not DECODE is a hard boot
+	// error, not a silently-ignored one: the alternative is booting with MFA
+	// quietly off because a row got mangled, which is the failure mode an owner
+	// would never notice until it mattered. The pending secret is deliberately
+	// NOT loaded into the snapshot — it is read straight from the DB by activate
+	// (a once-per-enrolment path with no hot reader).
+	totpSecret, err := d.GetSetting(settingTOTPSecret)
+	if err != nil {
+		return out, err
+	}
+	if totpSecret != nil && *totpSecret != "" {
+		if _, err := decodeTOTPSecret(*totpSecret); err != nil {
+			return out, fmt.Errorf("settings %s: %w", settingTOTPSecret, err)
+		}
+		out.totpSecret = *totpSecret
+	}
+
+	lastStep, err := d.GetSetting(settingTOTPLastStep)
+	if err != nil {
+		return out, err
+	}
+	if lastStep != nil {
+		n, err := strconv.ParseInt(*lastStep, 10, 64)
+		if err != nil || n < 0 {
+			return out, fmt.Errorf("settings %s: not a non-negative integer: %q", settingTOTPLastStep, *lastStep)
+		}
+		out.totpLastStep = n
 	}
 
 	legacyTTL, err := d.GetSetting(settingLegacyTokenTTL)
@@ -747,6 +796,41 @@ func cmdSetPassword(env func(string) string, out io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(out, "[ocserverd] set-password: owner password hash stored in DB settings (takes effect at the next serve start)")
+	return 0
+}
+
+// cmdMFADisable (ocserverd mfa-disable) clears the owner's TOTP second factor
+// from DB settings. It is THE lost-authenticator recovery path, and the only
+// one — POST /api/auth/mfa/disable deliberately cannot serve that purpose,
+// because it demands a live code from the very device that was lost.
+//
+// 🔴 WHY THIS IS NOT A BACKDOOR. It substitutes proof of HOST SHELL ACCESS for
+// proof of the factor, which is the same trust substitution the first-run claim
+// token already makes, and it grants nothing new: whoever can run this can also
+// run `set-password`, read the SQLite file, or replace the binary. A second
+// factor was never a defence against someone standing on the host — it defends
+// the network face, where the password alone used to be enough.
+//
+// It is deliberately IDEMPOTENT and silent about whether a factor was armed: an
+// operator running this has already lost access and does not need a puzzle, and
+// "was MFA on?" is not a secret worth a distinct exit code here.
+//
+// Exit codes: 0 = cleared (or nothing was armed), 1 = fatal.
+func cmdMFADisable(env func(string) string, out io.Writer) int {
+	d, _, done, rc := openAuthDAL("mfa-disable", env, out)
+	defer done()
+	if rc != 0 {
+		return rc
+	}
+	// Every key the ceremony can leave behind, so a re-enrolment starts clean
+	// rather than inheriting a floor or a stale pending secret.
+	for _, key := range []string{settingTOTPSecret, settingTOTPPendingSecret, settingTOTPLastStep} {
+		if err := d.DeleteSetting(key); err != nil {
+			fmt.Fprintf(out, "[ocserverd] FATAL: clear %s: %v\n", key, err)
+			return 1
+		}
+	}
+	fmt.Fprintln(out, "[ocserverd] mfa-disable: the owner's second factor is cleared (takes effect at the next serve start)")
 	return 0
 }
 

@@ -428,3 +428,42 @@
   font-size: 12px;
   color: var(--color-dot-online);
 }
+
+/* ── second-factor (TOTP) view ─────────────────────────────────────────────
+   Explanatory copy, the one-time setup key, and the deep link. The key is
+   rendered as selectable monospace rather than a QR image: this menu has no QR
+   renderer, and pulling in an image/canvas dependency for a single screen is not
+   worth it when the otpauth link covers the phone case directly. */
+.profile-dd__hint {
+  margin: 0 2px 2px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--color-text-muted);
+}
+
+.profile-dd__code {
+  /* break-all, not nowrap: a 32-char base32 key must stay fully readable in a
+     narrow dropdown — an ellipsis here would hand the owner a truncated secret,
+     which is worse than an ugly wrap. */
+  display: block;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-overlay) 6%, transparent);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  color: var(--color-text-strong);
+  user-select: all;
+}
+
+.profile-dd__link {
+  font-size: 12px;
+  color: var(--color-accent, var(--color-text-strong));
+}
+
+.profile-dd__submit--danger {
+  /* Disarming a credential is destructive and reads that way, matching the
+     logout row's treatment. */
+  color: var(--color-danger);
+}

@@ -640,8 +640,14 @@
         "type": "object"
       },
       "AuthStatusDTO": {
-        "description": "First-run probe (`GET /api/auth/status`, PUBLIC): whether an owner password\nhas been set. The UI branches first-run setup vs login on this; /api/login\nitself stays a flat 401 either way and never discloses the first-run state.",
+        "description": "First-run probe (`GET /api/auth/status`, PUBLIC): whether an owner password\nhas been set. The UI branches first-run setup vs login on this; /api/login\nitself stays a flat 401 either way and never discloses the first-run state.\n\n`mfa_required` says whether the login wall must also collect a TOTP code. It is disclosed to an unauthenticated caller DELIBERATELY: the wall has to render the right number of fields before anyone has a token, and the alternative (a distinguishable \"password ok, code missing\" refusal) discloses strictly more — it confirms a correct password. What leaks here is one bit an attacker learns from a single login attempt anyway.",
         "properties": {
+          "mfa_required": {
+            "default": false,
+            "description": "Whether an active TOTP secret is enrolled, i.e. whether `/api/login` demands a `code`. Optional for compatibility: a client that does not read it, or an older server that does not send it, behaves exactly as before.",
+            "title": "Mfa Required",
+            "type": "boolean"
+          },
           "password_set": {
             "title": "Password Set",
             "type": "boolean"
@@ -2038,8 +2044,13 @@
         "type": "object"
       },
       "LoginDTO": {
-        "description": "Owner login request: the password exchanged at `/api/login` for a JWT.",
+        "description": "Owner login request: the password exchanged at `/api/login` for a JWT.\n\n`code` is the TOTP second factor, and it is OPTIONAL in the schema on purpose — it is required by SERVER STATE, not by the wire. While the owner has no TOTP secret enrolled it must be absent (or null) and is ignored; once enrolled, a login without it is a flat 401. Making it schema-required would break every existing client on an install that never turned MFA on.",
         "properties": {
+          "code": {
+            "description": "TOTP code from the owner's authenticator app. Required only while MFA is enrolled (`GET /api/auth/status` → `mfa_required`). Separators are tolerated: \"123 456\" verifies the same as \"123456\".",
+            "title": "Code",
+            "type": "string"
+          },
           "password": {
             "title": "Password",
             "type": "string"
@@ -2049,6 +2060,90 @@
           "password"
         ],
         "title": "LoginDTO",
+        "additionalProperties": false,
+        "type": "object"
+      },
+      "MfaActivateDTO": {
+        "description": "Prove a pending TOTP enrolment and ARM the second factor (`POST /api/auth/mfa/activate`, owner-gated). The code must verify against the secret `…/mfa/enroll` handed out; on success that secret becomes the ACTIVE one and the second factor is armed from the next login onward. A wrong code or password leaves the pending secret in place so the owner can simply try again.\n\n🔴 `password` IS REQUIRED, and the owner token alone is deliberately not enough. Arming a factor is as destructive as removing one: an attacker holding only a stolen owner token could otherwise enrol a secret THEY control and activate it, after which the real owner's password yields 401 and they cannot disable it (that needs a live code from the attacker's authenticator) — a transient token theft turned into a durable lockout recoverable only from a host shell. The same reasoning that makes `…/mfa/disable` demand both factors applies symmetrically to arming.",
+        "properties": {
+          "code": {
+            "description": "TOTP code generated from the pending secret. Separators are tolerated.",
+            "title": "Code",
+            "type": "string"
+          },
+          "password": {
+            "description": "The current owner password. Re-proved here so a stolen session cannot arm a factor the owner does not hold.",
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password",
+          "code"
+        ],
+        "title": "MfaActivateDTO",
+        "additionalProperties": false,
+        "type": "object"
+      },
+      "MfaDisableDTO": {
+        "description": "Turn the second factor off (`POST /api/auth/mfa/disable`, owner-gated). BOTH the current password and a live TOTP code are required: an owner-gated session alone must not be able to strip MFA, because the whole point of the factor is to survive a stolen session. An owner who has LOST their authenticator cannot satisfy this by design — that recovery path is the local `ocserverd mfa-disable` command, which proves host shell access instead.",
+        "properties": {
+          "code": {
+            "description": "Live TOTP code from the enrolled authenticator. Separators are tolerated.",
+            "title": "Code",
+            "type": "string"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password",
+          "code"
+        ],
+        "title": "MfaDisableDTO",
+        "additionalProperties": false,
+        "type": "object"
+      },
+      "MfaStateDTO": {
+        "description": "The owner's second-factor state, answered by every `/api/auth/mfa/*` write.\n\n`enrolled` is the armed bit — true only once a pending secret has been PROVEN by `…/activate`.\n\n`secret` and `otpauth_uri` are non-null ONLY in the response to `…/enroll`, and only for the pending (not yet armed) secret. They are the one moment the secret crosses the wire, because an authenticator app cannot be enrolled without it; the server never echoes an ACTIVE secret back afterwards, so a stolen owner token cannot read out an existing enrolment and clone it.",
+        "properties": {
+          "enrolled": {
+            "title": "Enrolled",
+            "type": "boolean"
+          },
+          "otpauth_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `otpauth://totp/…` URI for a pending enrolment (QR / deep-link form), else null.",
+            "title": "Otpauth Uri"
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The base32 secret for a pending enrolment, for manual entry into an authenticator app; null otherwise.",
+            "title": "Secret"
+          }
+        },
+        "required": [
+          "enrolled",
+          "secret",
+          "otpauth_uri"
+        ],
+        "title": "MfaStateDTO",
         "additionalProperties": false,
         "type": "object"
       },
@@ -8436,6 +8531,182 @@
         }
       }
     },
+    "/api/auth/mfa/activate": {
+      "post": {
+        "description": "Prove a pending TOTP enrolment and arm the second factor (owner-gated).\n\nOn success the pending secret becomes the active one, the pending slot is cleared, and `/api/login` demands a code from the next login onward. Existing owner tokens are deliberately NOT revoked: the session doing this just proved the password (to log in) and now the code as well, so it is the most strongly authenticated session on the install — logging it out would be theatre.\n\n409 when there is no pending secret to prove, or when a factor is already active. A wrong code is 401 and leaves the pending secret intact for a retry.",
+        "operationId": "handle_mfa_activate_api_auth_mfa_activate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaActivateDTO"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStateDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Validation error (unified error envelope)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Client error (unified error envelope)."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Server error (unified error envelope)."
+          }
+        },
+        "summary": "Arm the second factor by proving a code from the pending secret.",
+        "x-mcp": {
+          "include": false
+        }
+      }
+    },
+    "/api/auth/mfa/disable": {
+      "post": {
+        "description": "Disarm the TOTP second factor (owner-gated), clearing the active secret, any pending secret and the replay floor.\n\nBOTH the current password and a live code are required. An owner-gated session is deliberately not enough on its own: a factor that a stolen session can switch off protects nothing after the session is stolen.\n\nThis is therefore NOT the lost-phone recovery path — an owner who cannot generate a code cannot use this endpoint at all. Recovery is the local `ocserverd mfa-disable` command, which substitutes proof of HOST SHELL ACCESS for proof of the factor. That is the same trust substitution the first-run claim token already makes, rather than a new backdoor.\n\n409 when no factor is active; 401 on a wrong password or code.",
+        "operationId": "handle_mfa_disable_api_auth_mfa_disable_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaDisableDTO"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStateDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Validation error (unified error envelope)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Client error (unified error envelope)."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Server error (unified error envelope)."
+          }
+        },
+        "summary": "Turn the second factor off (password + live code required).",
+        "x-mcp": {
+          "include": false
+        }
+      }
+    },
+    "/api/auth/mfa/enroll": {
+      "post": {
+        "description": "Mint a PENDING TOTP secret and return it once, with its `otpauth://` URI, so the owner can add it to an authenticator app (owner-gated).\n\nThis does NOT arm the second factor. The secret sits in a pending slot until `…/mfa/activate` proves a code generated from it; only then does it become active. That two-step shape is the whole safety property: enrolling straight into the active slot would let a mis-scanned QR lock the owner out of their own server on the very next login, with no way back except host shell access.\n\nCalling this again REPLACES any unproven pending secret (the previous one becomes unusable), so an owner who lost the enrolment screen simply starts over. It is refused with 409 while a factor is already active — rotating an armed secret means disabling it first, which requires proving the old one.",
+        "operationId": "handle_mfa_enroll_api_auth_mfa_enroll_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStateDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Validation error (unified error envelope)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Client error (unified error envelope)."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeDTO"
+                }
+              }
+            },
+            "description": "Server error (unified error envelope)."
+          }
+        },
+        "summary": "Begin TOTP enrolment: mint a pending secret + otpauth URI.",
+        "x-mcp": {
+          "include": false
+        }
+      }
+    },
     "/api/auth/set-password": {
       "post": {
         "description": "First-time owner-password claim (PUBLIC, claim-token gated). The server mints\na one-shot claim token at first boot (no password set) and prints it ONLY to\nthe local serve log / installer banner; presenting it here proves host shell\naccess — the gate that stops a public-tunnel visitor from claiming a fresh\nserver. Order of checks: password already set → 409 (the token is never\nconsulted); claim token mismatch → 401; otherwise the argon2id hash is stored,\nthe claim token is deleted, and a fresh owner token is minted (the response\nlogs the caller straight in).",
@@ -8500,7 +8771,7 @@
     },
     "/api/auth/status": {
       "get": {
-        "description": "First-run probe: whether an owner password has been set (PUBLIC — the UI\nbranches first-run setup vs login on this single bit; nothing else about the\nauth state is disclosed).",
+        "description": "Pre-auth probe (PUBLIC): whether an owner password has been set, and whether\nthe login wall must also collect a TOTP code. The UI branches first-run setup\nvs login on `password_set` and renders its code field from `mfa_required`; see\nAuthStatusDTO for why that second bit is disclosed to an unauthenticated\ncaller. Nothing else about the auth state is disclosed — never the secret, the\nreplay floor, or the attempt budget.",
         "operationId": "handle_auth_status_api_auth_status_get",
         "responses": {
           "200": {
@@ -11009,7 +11280,7 @@
     },
     "/api/login": {
       "post": {
-        "description": "Exchange the owner password for an owner-scoped JWT (M1 §3.5).\n\nThe single PUBLIC business entry point. The submitted password is compared\n(constant-time) against the configured `[auth].password`; on a match an\nHS256 JWT scoped to the single owner (`sub = DEFAULT_OWNER`, `scope=owner`)\nis minted with the configured TTL, and is thereafter the one credential for\nREST / MCP / SSE. A wrong password — or no password configured at all\n(deny-by-default) — is a flat 401, with no hint which it was.\n\nThe signing secret and the expected password are resolved once at\n`create_app` time and held on `app.state`; this handler never sees a\nhard-coded secret.",
+        "description": "Exchange the owner password for an owner-scoped JWT (M1 §3.5).\n\nThe single PUBLIC business entry point. The submitted password is verified\nagainst the argon2id hash in the DB settings table (`auth.password_hash`); on\na match an HS256 JWT scoped to the single owner (`sub = DEFAULT_OWNER`,\n`scope=owner`) is minted with the configured TTL, and is thereafter the one\ncredential for REST / MCP / SSE. A wrong password — or no password set at all\n(deny-by-default) — is a flat 401, with no hint which it was.\n\nWhile the owner has a TOTP secret enrolled (`GET /api/auth/status` →\n`mfa_required`), a correct password is NOT sufficient: `code` must also verify,\nand its absence or a wrong value is the same flat 401. A code is single-use —\nreplaying one inside its ~90s acceptance window is refused.\n\nEvery failed attempt — wrong password AND wrong code alike — spends from a\nserver-wide credential-attempt budget. Past a small free allowance the next\nattempt is refused with 429 and a `Retry-After` header, backing off\nexponentially to a cap; a success clears the history. The budget is\nSERVER-WIDE rather than per-client on purpose: the server binds loopback, so\nevery remote caller arrives through a tunnel and is indistinguishable by\naddress.\n\nThe signing secret and the password hash are loaded from the DB settings table\nat boot and updated in place by the owner endpoints; this handler never sees a\nhard-coded secret.",
         "operationId": "handle_login_api_login_post",
         "requestBody": {
           "content": {

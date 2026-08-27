@@ -55,7 +55,9 @@ describe("FirstRunPage", () => {
     fireEvent.click(utils.getByText(f.submit));
     await waitFor(() => expect(utils.onSuccess).toHaveBeenCalled());
     // The mock now reports the password as set (the server-side flip).
-    await expect(api.getAuthStatus()).resolves.toBe(true);
+    await expect(api.getAuthStatus()).resolves.toMatchObject({
+      passwordSet: true,
+    });
   });
 
   it("surfaces a wrong claim token as an inline error, no entry", async () => {
@@ -64,7 +66,9 @@ describe("FirstRunPage", () => {
     fireEvent.click(utils.getByText(f.submit));
     await utils.findByText(f.errorClaim);
     expect(utils.onSuccess).not.toHaveBeenCalled();
-    await expect(api.getAuthStatus()).resolves.toBe(false);
+    await expect(api.getAuthStatus()).resolves.toMatchObject({
+      passwordSet: false,
+    });
   });
 
   it("rejects a short password and a mismatched confirmation locally", async () => {

@@ -58,7 +58,7 @@ retired `var/jwt_secret` fallback file has no successor.
 
 | mint | scope / sub | ttl | machine_id claim |
 |---|---|---|---|
-| `POST /api/login` (owner password → token) | `owner` / the fixed single-tenant owner id `"owner"` | DB setting `auth.owner_token_ttl` (default **86400 s**; owner-adjustable via `PATCH /api/settings`, applies from the next login) | none |
+| `POST /api/login` (owner password **+ TOTP code once enrolled** → token) | `owner` / the fixed single-tenant owner id `"owner"` | DB setting `auth.owner_token_ttl` (default **86400 s**; owner-adjustable via `PATCH /api/settings`, applies from the next login) | none |
 | `POST /api/tokens/mint` (owner-gated) | `agent` / `body.member_id` | `min(ttl_days*86400, 400 days)` — the 400-day ceiling MUST cap every long-lived agent token | none |
 | `POST /api/bootstrap` (with `member_id`) | `agent` / member id | DB setting `auth.agent_token_ttl` (default **604800 s**) | `member.desired_machine_id` (omitted if empty) |
 | reconcile START payload (server-side, per spawn) | `agent` / member id | `auth.agent_token_ttl` | `member.desired_machine_id` |
@@ -73,10 +73,45 @@ ceiling for non-warden agent-token mints.
 - Login MUST verify the password against the DB-stored argon2id hash (`auth.password_hash`)
   and answer a flat 401 for a wrong password OR no set password, with no distinguishing
   hint (the first-run state is disclosed only by the PUBLIC `GET /api/auth/status`).
+- **Second factor (TOTP).** While `auth.totp_secret` holds an ACTIVE secret, a correct
+  password is NOT sufficient: login MUST also verify a RFC 6238 code (HMAC-SHA1, 6 digits,
+  30 s step, ±1 step accepted) and MUST answer the SAME flat 401 when the code is missing
+  or wrong — the refusal never says which factor failed, because naming it confirms a
+  correct password to someone who guessed only that half. Codes are SINGLE-USE: the
+  highest step accepted is persisted as `auth.totp_last_step` and every candidate at or
+  below it is refused, so a code cannot be replayed inside its own acceptance window.
+  Verifying and advancing that floor MUST be one critical section, or two concurrent
+  logins presenting the same code both pass.
+  - Arming is a two-step ceremony and BOTH steps are owner-gated: `POST /api/auth/mfa/enroll`
+    writes an inert `auth.totp_pending_secret` and returns it once (the only moment a secret
+    crosses the wire); `POST /api/auth/mfa/activate` MUST require the current **password**
+    as well as a code from that pending secret before promoting it. The password is required
+    because ARMING is as destructive as removing — a stolen owner token alone could
+    otherwise install a factor the attacker controls and lock the owner out.
+  - `POST /api/auth/mfa/disable` MUST require both the password and a live code: a factor a
+    stolen session can switch off protects nothing after the theft. It is therefore NOT the
+    lost-authenticator path — that is the local `ocserverd mfa-disable` command, which
+    substitutes proof of host shell access and takes effect at the next serve start.
+  - `GET /api/auth/status` additionally discloses `mfa_required` to unauthenticated callers,
+    deliberately: the login wall must render the right fields before any token exists, and a
+    distinguishable "password ok, code missing" refusal would leak strictly more.
+- **Credential-attempt brake.** Every seam that compares a caller-supplied secret —
+  `POST /api/login`, `POST /api/auth/set-password`'s claim token,
+  `POST /api/auth/change-password`, and the `/api/auth/mfa/activate` + `/api/auth/mfa/disable`
+  credential checks — spends from ONE server-wide budget. Past a small free allowance the
+  next attempt is refused with **429 + `Retry-After`**, backing off exponentially to a cap;
+  a success clears it. The budget is server-wide rather than per-client because the server
+  binds loopback, so every remote caller arrives through a tunnel and is indistinguishable
+  by address. Two ordering rules are contract, not style:
+  - the brake MUST sit AFTER any refusal that consults no credential (the `409`s on
+    set-password, mfa/activate and mfa/disable), or a documented 409 becomes a 429;
+  - the gate MUST reserve, not merely read: a concurrent burst that only checks the
+    deadline passes in its entirety, which both defeats the backoff and admits N
+    simultaneous argon2id verifications.
 - First-run claim: while no password is set, serve start mints a one-shot
   `auth.claim_token` and prints it ONLY to the local serve log / installer banner;
   `POST /api/auth/set-password` MUST require it (401 mismatch; 409 once a password
-  exists) and MUST consume it on success. Possession proves host shell access — the gate
+  exists; 429 once the attempt budget is spent) and MUST consume it on success. Possession proves host shell access — the gate
   against a public-tunnel visitor claiming a fresh server.
 - Machine claim codes: the onboard / boot-command responses mint a **one-time claim code**
   (32 random bytes, base64url) alongside the exec-token, and the `boot_command` one-liner

@@ -123,9 +123,20 @@ func t6020AllOpenedRows() map[[2]string]string {
 // self-escalation, and the password / Web Push rows are the owner's own account
 // and own browser, not an office capability. T-c826 later added the owner's
 // explicit choice that personal member identity/presentation also stays here.
+//
+// The three /api/auth/mfa/* rows join them on the SAME reasoning as
+// change-password, one step stronger: they decide how the OWNER authenticates.
+// An admin_agent that could reach them could weaken — or, via enroll+activate,
+// seize — the credential that governs it, so opening them would hand the office
+// a way to escalate past its own owner. Off the MCP surface entirely for the
+// same reason the password is: arming or disarming the owner's second factor is
+// never something an agent does on the owner's behalf.
 var t6020Withheld = [][2]string{
 	{"POST", "/api/mint"},
 	{"POST", "/api/auth/change-password"},
+	{"POST", "/api/auth/mfa/enroll"},
+	{"POST", "/api/auth/mfa/activate"},
+	{"POST", "/api/auth/mfa/disable"},
 	{"GET", "/api/push/public-key"},
 	{"POST", "/api/push/subscription"},
 	{"DELETE", "/api/push/subscription"},
@@ -263,8 +274,14 @@ func TestT6020OpenedToolsAreInTheFrozenCatalog(t *testing.T) {
 }
 
 func TestT6020WithheldRoutesStayOwnerOnlyAndOffTheMCPSurface(t *testing.T) {
-	if len(t6020Withheld) != 7 {
-		t.Fatalf("the owner rulings withheld 7 routes, this table lists %d", len(t6020Withheld))
+	// 7 from the original rulings + the 3 second-factor rows (see the table's
+	// note). The literal is kept so ADDING an owner-only row stays a deliberate
+	// act with a reason attached, which is the whole point of this file.
+	if len(t6020Withheld) != 10 {
+		t.Fatalf("this table must list 10 owner-only routes and lists %d — 7 from the "+
+			"owner rulings plus the 3 /api/auth/mfa/* rows added by the MFA change "+
+			"(see the note on the table). Do not read the 10 as an owner ruling: the "+
+			"owner ruled on 7.", len(t6020Withheld))
 	}
 	index := t6020RouteIndex(t)
 	// Scan the tool index by ROUTE (not by name): a withheld row that grew a

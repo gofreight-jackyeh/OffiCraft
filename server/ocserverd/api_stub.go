@@ -54,8 +54,20 @@ type apiServer struct {
 	// revocation cut: owner-scope tokens with iat before it are refused at the
 	// auth gate (requireAuth) — stamped by change-password.
 	passwordChangedAt int64
-	ownerTokenTTL     int64
-	agentTokenTTL     int64
+	// totpSecret is the owner's ACTIVE TOTP secret ("" = MFA off). Its presence
+	// is what makes /api/login demand a second factor; totpLastStep is the
+	// replay floor (the highest step already spent). Both live under settingsMu
+	// with the rest of the auth snapshot — login reads them on every attempt.
+	totpSecret   string
+	totpLastStep int64
+	// loginThrottle is the brute-force brake shared by every credential-guessing
+	// seam (throttle.go). In-memory and process-local, like machineClaims: a
+	// restart clears it, which is acceptable because restarting requires the
+	// host shell — an attacker who already has that does not need to guess the
+	// password.
+	loginThrottle credentialThrottle
+	ownerTokenTTL int64
+	agentTokenTTL int64
 	// outsourceMaxParallel is the global cap on concurrently live outsource
 	// workers (DB task.outsource_max_parallel; M3 owner ruling ③) — read by
 	// the Phase 2 assignment scheduler.
@@ -411,6 +423,21 @@ func (s *apiServer) authPasswordHash() string {
 	s.settingsMu.RLock()
 	defer s.settingsMu.RUnlock()
 	return s.passwordHash
+}
+
+// authMFAEnrolled reports whether the second factor is armed.
+//
+// 🔴 There is deliberately NO read-only accessor that hands out the secret and
+// the replay floor together for a caller to verify against. Verification MUST
+// advance the floor, and a read-then-write pair is a replay window: two
+// concurrent logins presenting the SAME code would both read the old floor and
+// both pass, which is precisely the attack the floor exists to stop. The verify
+// and the spend live in one write-locked seam instead — verifyAndSpendTOTP
+// (api_auth_mfa.go).
+func (s *apiServer) authMFAEnrolled() bool {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.totpSecret != ""
 }
 
 // authPasswordChangedAt returns the owner-token iat floor (0 = no cut).

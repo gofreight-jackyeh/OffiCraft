@@ -14,6 +14,11 @@ import (
 // (service.config.MAX_AGENT_TTL_SECS — 400 days).
 const maxAgentTTLSecs int64 = 400 * 86400
 
+// invalidCredentialsMsg is the ONE refusal text /api/login answers with, for
+// every cause. It names both factors so the cockpit can point the owner at the
+// right field without the server disclosing which half actually failed.
+const invalidCredentialsMsg = "invalid password or code"
+
 // mintAgentToken is the ONE agent-scope boot-JWT mint under both spawn paths:
 // scope="agent", sub=the member/worker id, machine_id = the boot host claim
 // (omitted when empty). Members bind their durable desired machine; workers
@@ -39,31 +44,89 @@ func (s *apiServer) mintWardenToken(m Member) (string, error) {
 	return mintJWTWithoutExpiry(m.ID, "agent", s.secret, time.Now().Unix(), "")
 }
 
-// POST /api/login — exchange the owner password for an owner-scoped JWT.
-// Verified ONLY against the DB-stored argon2id hash (settings.go); the B1
-// oc.toml plaintext fallback is gone (B2). A wrong password OR no set
-// password is a flat 401 with no distinguishing hint (the first-run state is
-// only ever disclosed by the B3 /api/auth/status endpoint).
+// POST /api/login — exchange the owner password (and, once enrolled, a TOTP
+// code) for an owner-scoped JWT. Verified ONLY against the DB-stored argon2id
+// hash (settings.go); the B1 oc.toml plaintext fallback is gone (B2).
+//
+// EVERY refusal on this route is the SAME flat 401 with the same message — no
+// set password, wrong password, missing code and wrong code are indistinguishable
+// (the first-run state is only ever disclosed by the B3 /api/auth/status
+// endpoint, and `mfa_required` by the same one). Naming which factor failed
+// would confirm a correct password to an attacker who has only guessed one
+// half.
+//
+// 🔴 THE UX COST IS REAL AND ACCEPTED: an owner who fat-fingers the 6-digit
+// code is told "invalid password or code", not "invalid code". The cockpit
+// covers this by wording its inline error to name both fields, which is honest
+// without the server disclosing anything.
+//
+// Failed attempts spend from the shared credential-attempt budget (throttle.go);
+// a success clears it.
 func (s *apiServer) HandleLoginApiLoginPost(w http.ResponseWriter, r *http.Request) {
 	var body LoginDTO
 	if !decodeJSONBodyRequired(w, r, &body, "password") {
 		return
 	}
-	hash := s.authPasswordHash()
-	if hash == "" || !verifyPassword(body.Password, hash) {
-		writeError(w, http.StatusUnauthorized, "invalid password")
-		return
-	}
+	// Server CONFIGURATION is settled before any credential work: a missing
+	// signing secret is not a credential fact, so it must not spend from the
+	// attempt budget, must not burn a TOTP step, and must not be answered with
+	// the credential refusal. It used to sit after the whole verification, which
+	// made it the one distinguishable refusal on a route whose contract above
+	// says every refusal is identical.
 	if len(s.secret) == 0 {
 		writeError(w, http.StatusUnauthorized, "auth not configured")
+		return
+	}
+	// The brake sits BEFORE argon2id on purpose: at ~19 MiB and ~50 ms a
+	// verification, the hash is itself the cheapest denial-of-service on this
+	// server. begin (not retryAfter) both checks the deadline and RESERVES an
+	// in-flight slot, which is what stops a concurrent burst walking through the
+	// gate and running N argon2id verifications at once.
+	release, wait, blocked := s.loginThrottle.begin(time.Now())
+	if blocked {
+		writeThrottled(w, wait)
+		return
+	}
+	defer release()
+
+	hash := s.authPasswordHash()
+	if hash == "" || !verifyPassword(body.Password, hash) {
+		s.loginThrottle.noteFailure(time.Now())
+		writeError(w, http.StatusUnauthorized, invalidCredentialsMsg)
+		return
+	}
+	// Second factor, when one is armed. verifyAndSpendTOTP is a no-op that
+	// answers true while MFA is off, so this is the whole branch.
+	code := ""
+	if body.Code != nil {
+		code = *body.Code
+	}
+	factorOK, err := s.verifyAndSpendTOTP(code, time.Now().Unix())
+	if err != nil {
+		// The floor could not be persisted, so the code was not really spent.
+		// Failing closed here keeps a code from being replayable across the
+		// restart that a storage fault tends to be followed by.
+		internalError(w, err)
+		return
+	}
+	if !factorOK {
+		s.loginThrottle.noteFailure(time.Now())
+		writeError(w, http.StatusUnauthorized, invalidCredentialsMsg)
 		return
 	}
 	ttl := s.ownerTokenTTLValue()
 	token, err := mintJWT(wireOwnerID, "owner", ttl, s.secret, time.Now().Unix(), "")
 	if err != nil {
+		// Deliberately BEFORE noteSuccess: a mint failure is a server fault, and
+		// clearing the budget on it would let a failed login look like a proven
+		// one. The TOTP step is already spent either way (it had to be, to be
+		// single-use), so the owner waits for the next tick — unavoidable, but
+		// they should not also have their attempt history silently cleared.
 		internalError(w, err)
 		return
 	}
+	// Only now is the credential PROVEN all the way to a usable token.
+	s.loginThrottle.noteSuccess()
 	writeJSON(w, http.StatusOK, tokenDTO{
 		Token:     token,
 		TokenType: "bearer",

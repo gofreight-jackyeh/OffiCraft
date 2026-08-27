@@ -49,6 +49,8 @@ export interface Messages {
   taskMarkDuplicateBody: (taskNo: string) => string;
   taskDuplicateOf: (taskNo: string) => string;
   taskReassignTitle: (taskNo: string) => string;
+  // ── login / the credential-attempt brake ──
+  loginThrottled: (secs: number) => string;
   // ── replies ──
   replyWaited: (elapsed: string) => string;
   replyOpenedAt: (time: string) => string;
@@ -151,6 +153,7 @@ export function makeMessages(t: Dict, language: Lang): Messages {
   // languages disagree: en writes a space, zh runs the characters together.
   const sp = language === "zh" ? "" : " ";
   const tasks = t.tasks;
+  const login = t.login;
   const replies = t.replies;
   const chat = t.chat;
   const mp = t.mp;
@@ -198,6 +201,13 @@ export function makeMessages(t: Dict, language: Lang): Messages {
       `${tasks.progressLabel} ${done}/${total}`,
     // 「步驟 N/M · 已歷時 X」 is ONE visible string. Leaving elapsed as a template
     // left 步驟 overridable and 已歷時 not, inside that one sentence.
+    // The 429 wait. The space AFTER the number is language-specific and is the
+    // OPPOSITE of `sp`: zh writes 「請於 42 秒後再試。」 (spaces both sides), en
+    // writes "in 42s." (none). It cannot reuse `sp`, and it is not baked into
+    // the tail fragment because a wording editor renders fragments verbatim and
+    // a leading space there would be invisible to whoever edits it.
+    loginThrottled: (secs) =>
+      `${login.throttledLead} ${secs}${language === "zh" ? " " : ""}${login.throttledTail}`,
     taskElapsed: (elapsed) => `${tasks.elapsedLabel} ${elapsed}`,
     taskPlanningBy: (name) =>
       `${tasks.planningByLead} ${name} ${tasks.planningByTail}`,

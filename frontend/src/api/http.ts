@@ -30,6 +30,8 @@ import type {
   VersionView,
   ReleaseCheckView,
   BackupHealthView,
+  AuthStatusView,
+  MfaEnrollView,
   GlobalContextView,
   BootDocKind,
   BootDocView,
@@ -147,7 +149,7 @@ import {
 // arm, so listReplyCards has to narrow to it. See that function.
 import type { WireReplyCard } from "./wire";
 import { ownerToken, setToken } from "./auth";
-import { ApiError } from "./errors";
+import { ApiError, parseRetryAfter } from "./errors";
 import { client } from "./client";
 
 // Auth is cross-cutting and lives in ONE place each: owner-JWT sourcing
@@ -182,11 +184,11 @@ export function authedAttachmentUrl(url?: string): string | undefined {
 // throwing the SAME ApiError the client middleware throws — but WITHOUT the
 // 401 → clear-token + oc-auth-expired reaction (a wrong claim/current
 // password is an inline form error, never a logout).
-async function credentialPost(
+async function credentialPost<T = { token: string }>(
   path: string,
   body: unknown,
   token?: string,
-): Promise<{ token: string }> {
+): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -213,9 +215,10 @@ async function credentialPost(
       res.status,
       code,
       serverMessage,
+      parseRetryAfter(res.headers.get("Retry-After")),
     );
   }
-  return (await res.json()) as { token: string };
+  return (await res.json()) as T;
 }
 
 // ── shared SSE downlink (connection pool fix) ──────────────────────────────
@@ -1706,11 +1709,49 @@ export const httpApi: Api = {
     return toBackupHealth(wire);
   },
 
-  async getAuthStatus(): Promise<boolean> {
+  async getAuthStatus(): Promise<AuthStatusView> {
     // GET /api/auth/status (PUBLIC) -> AuthStatusDTO. Rides the typed client
     // (a public route never 401s, so the auth-expired middleware is inert).
+    //
+    // `mfa_required` is OPTIONAL on the wire so an older server keeps working;
+    // absent means no second factor, which is the pre-MFA behaviour exactly.
     const wire = unwrap(await client.GET("/api/auth/status"));
-    return wire.password_set;
+    return {
+      passwordSet: wire.password_set,
+      mfaRequired: wire.mfa_required ?? false,
+    };
+  },
+
+  async enrollMfa(): Promise<MfaEnrollView> {
+    // POST /api/auth/mfa/enroll (owner-gated) -> MfaStateDTO carrying the
+    // PENDING secret. Rides the typed client: this one IS owner-gated, so a 401
+    // here genuinely means the session died and bouncing the auth wall is right.
+    const wire = unwrap(await client.POST("/api/auth/mfa/enroll"));
+    return {
+      secret: wire.secret ?? "",
+      otpauthUri: wire.otpauth_uri ?? "",
+    };
+  },
+
+  async activateMfa(password: string, code: string): Promise<void> {
+    // POST /api/auth/mfa/activate. HAND-WRITTEN via credentialPost like the
+    // other credential seams: a wrong password or code is an inline form error,
+    // and the typed client's middleware would turn its 401 into a logout instead.
+    await credentialPost<unknown>(
+      "/api/auth/mfa/activate",
+      { password, code },
+      ownerToken(),
+    );
+  },
+
+  async disableMfa(password: string, code: string): Promise<void> {
+    // POST /api/auth/mfa/disable — same reasoning as activateMfa: the 401 here
+    // means "wrong password or code", never "your session expired".
+    await credentialPost<unknown>(
+      "/api/auth/mfa/disable",
+      { password, code },
+      ownerToken(),
+    );
   },
 
   async setPassword(password: string, claimToken: string): Promise<void> {

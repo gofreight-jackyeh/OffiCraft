@@ -65,4 +65,17 @@ regexes = [
   # Content-scoped to the one literal (never the file, never the rule) so real
   # secrets in that file — and every other `online(t, api, …)` id — stay scanned.
   '''m-ed79-refocus''',
+  # The RFC 6238 Appendix B TOTP test seed, base32-encoded. This is a PUBLISHED
+  # value — the RFC prints the ASCII seed "12345678901234567890" and the codes it
+  # must produce, and both the Go unit tests (totp_test.go) and the mock adapter
+  # (frontend/src/api/mock.ts) use it so a TOTP implementation can be pinned
+  # against the standard's own vectors rather than against itself. gitleaks'
+  # generic-api-key rule fires on the `SECRET = "<32-char base32>"` assignment
+  # shape, which is exactly right in general and wrong here.
+  #
+  # 🔴 Content-scoped to this ONE literal on purpose, and never to a path: the
+  # files that carry it are the credential-handling code and its tests, which is
+  # the last place in the tree that should stop being scanned. A real TOTP secret
+  # is 20 random bytes and will not match this string.
+  '''GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ''',
 ]

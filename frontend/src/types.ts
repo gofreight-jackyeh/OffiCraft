@@ -903,6 +903,31 @@ export interface RoleDefView extends RoleSummaryView {
   definitionMd: string;
 }
 
+/** The PUBLIC pre-auth probe (`GET /api/auth/status`), both bits.
+ *
+ * `mfaRequired` is deliberately readable without a token: the login wall has to
+ * know how many fields to render before anyone is authenticated. The only
+ * alternative — letting /api/login answer differently for "password right, code
+ * missing" — would disclose strictly more, because it confirms a correct
+ * password. */
+export interface AuthStatusView {
+  passwordSet: boolean;
+  mfaRequired: boolean;
+}
+
+/** The one-time output of `POST /api/auth/mfa/enroll`.
+ *
+ * This is the ONLY moment a TOTP secret crosses the wire — an authenticator
+ * cannot be enrolled without it. The server never echoes an ACTIVE secret back,
+ * so this view has no "read my current secret" counterpart, and it must not be
+ * persisted anywhere by the cockpit. */
+export interface MfaEnrollView {
+  /** Base32 secret, for manual entry into an authenticator app. */
+  secret: string;
+  /** `otpauth://totp/…` URI — the QR / deep-link form of the same secret. */
+  otpauthUri: string;
+}
+
 /**
  * Whether the SCHEDULED database backup is still producing retreat points
  * (`GET /api/backup-health`, T-da06). Read by the 備份健康 block under

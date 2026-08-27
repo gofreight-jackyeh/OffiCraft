@@ -47,6 +47,7 @@ executes the host action).
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import uuid
 from dataclasses import dataclass, field
@@ -177,6 +178,29 @@ def _member_path(template: str):
         return template.format(member_id=target)
 
     return build
+
+
+def _mfa_activate_body(ctx: Ctx, identity: str):
+    """Body for the mfa/activate row, with its own precondition.
+
+    The owner (only at-or-above-floor) face ENROLS first, so a pending secret is
+    guaranteed present and the wrong code below is refused as a wrong code (401)
+    rather than as "nothing pending" (409). Denied identities must stay
+    side-effect free, so they just get the body.
+
+    Enrolling is safe to repeat: it overwrites any earlier UNPROVEN pending
+    secret and arms nothing, so this cannot leave an active factor behind for a
+    later login fixture to trip over.
+    """
+    if identity == "owner":
+        ctx.client.post(
+            "/api/auth/mfa/enroll",
+            headers={"Authorization": f"Bearer {ctx.owner_token}"},
+        )
+    # The REAL password with a WRONG code, so the 401 is earned by the code and
+    # not by a missing field (which would be a 422 and prove nothing about the
+    # authz gate this matrix exists to pin). activate demands both factors.
+    return {"password": os.environ["OC_OWNER_PASSWORD"], "code": "000000"}
 
 
 def _matrix_member_avatar_delete_path(ctx: Ctx, identity: str) -> str:
@@ -445,6 +469,37 @@ MATRIX: dict[str, Route] = {
         requires="owner",
         overrides={"owner": 401},
         body={"current_password": "conf-wrong-current", "new_password": "conf-new-password"},
+    ),
+    # ── owner second factor (TOTP) ───────────────────────────────────────────
+    # All three are owner-floor. This matrix pins the AUTHZ CHOKE; the ceremony
+    # itself (replay floor, both-factors disable, pending survival) is pinned in
+    # api_auth_mfa_test.go, because arming a real factor here would make every
+    # later login fixture in the run need a TOTP code.
+    #
+    # 🔴 NO ROW BELOW EVER ARMS A FACTOR, and that is what keeps these three
+    # order-independent — the same discipline _matrix_member_avatar_delete_path
+    # states for its own row. enroll only ever writes an INERT pending secret
+    # (nothing is armed until a code proves it), so every cell here sees the
+    # same "no active factor" state no matter which ran first.
+    "POST /api/auth/mfa/enroll": Route(
+        # Honest 200: a pending secret is inert. Nothing downstream is armed.
+        requires="owner",
+    ),
+    "POST /api/auth/mfa/activate": Route(
+        # 401, and DETERMINISTICALLY so: the body callable enrols first for the
+        # owner face, so a pending secret is guaranteed to exist and the wrong
+        # code below is refused on its own merits. Expecting 409 here instead
+        # would silently depend on whether the enroll row happened to run first.
+        requires="owner",
+        overrides={"owner": 401},
+        body=lambda ctx, identity: _mfa_activate_body(ctx, identity),
+    ),
+    "POST /api/auth/mfa/disable": Route(
+        # 409 — nothing is armed, and (see above) nothing in this matrix ever
+        # arms anything, so this holds regardless of row order.
+        requires="owner",
+        overrides={"owner": 409},
+        body={"password": "conf-wrong-current", "code": "000000"},
     ),
     "GET /api/settings": Route(requires="admin_agent"),
     "GET /api/push/public-key": Route(requires="owner"),
@@ -1619,6 +1674,19 @@ DEGRADED: dict[str, str] = {
         "owner face pinned at 401 (wrong current password): a real change would "
         "rotate the shared owner credential and revoke the session token fixture. "
         "The full change/revocation semantics are pinned in the server unit tests."
+    ),
+    "POST /api/auth/mfa/activate": (
+        "owner face pinned at 401 (the real password with a wrong code, against a "
+        "freshly enrolled pending secret): proving a REAL code would ARM the second factor on the "
+        "shared install, after which every later login fixture would need a TOTP "
+        "code. The enrol/activate/disable ceremony, the replay floor and the "
+        "both-factors disable rule are pinned in the server unit tests "
+        "(api_auth_mfa_test.go)."
+    ),
+    "POST /api/auth/mfa/disable": (
+        "owner face pinned at 409 (nothing armed): the positive face needs an "
+        "armed factor plus a live code, which is the same shared-credential "
+        "poisoning. Pinned in the server unit tests instead."
     ),
     "GET /api/docs/assets/{name}": (
         "probed with a missing asset name (404 across authenticated identities); "

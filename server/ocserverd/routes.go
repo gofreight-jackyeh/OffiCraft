@@ -183,6 +183,39 @@ func routeSpecs(w *ServerInterfaceWrapper) []RouteSpec {
 			// admin_agent — the owner's PERSONAL account credential.
 			MCPExclude: true, // the owner's credential, never an agent tool
 		},
+		// ── Owner second factor (TOTP) ───────────────────────────────────────
+		// All three are principalOwner + MCPExclude, for the same reason the two
+		// password rows above are: these endpoints decide how the OWNER
+		// authenticates. An admin_agent that could reach them could weaken the
+		// credential that governs it, and arming or disarming the owner's factor
+		// is never something an agent does on the owner's behalf.
+		{
+			Method:     "POST",
+			Path:       "/api/auth/mfa/enroll",
+			Handler:    w.HandleMfaEnrollApiAuthMfaEnrollPost,
+			Auth:       authGated,
+			Requires:   principalOwner,
+			Summary:    "Begin TOTP enrolment: mint a pending secret + otpauth URI.",
+			MCPExclude: true,
+		},
+		{
+			Method:     "POST",
+			Path:       "/api/auth/mfa/activate",
+			Handler:    w.HandleMfaActivateApiAuthMfaActivatePost,
+			Auth:       authGated,
+			Requires:   principalOwner,
+			Summary:    "Arm the second factor by proving a code from the pending secret.",
+			MCPExclude: true,
+		},
+		{
+			Method:     "POST",
+			Path:       "/api/auth/mfa/disable",
+			Handler:    w.HandleMfaDisableApiAuthMfaDisablePost,
+			Auth:       authGated,
+			Requires:   principalOwner,
+			Summary:    "Turn the second factor off (password + live code required).",
+			MCPExclude: true,
+		},
 		{
 			// T-6020: opened to admin_agent (owner 2026-07-26) — running the
 			// office needs the office's own knobs.

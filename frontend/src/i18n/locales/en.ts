@@ -454,6 +454,30 @@ export const en: Dict = {
     submit: "Sign in",
     submitting: "Signing in…",
     error: "Incorrect password, try again",
+    // Named BOTH fields on purpose. The server answers one indistinguishable
+    // 401 for a wrong password and a wrong code, because saying which failed
+    // would confirm a correct password to someone who guessed only that half.
+    // So the wall cannot know either — and must not pretend it does.
+    errorWithCode: "Incorrect password or code, try again",
+    codePlaceholder: "6-digit code",
+    codeHint: "From your authenticator app",
+    // 429 + Retry-After: the credential-attempt brake, not a wrong password.
+    //
+    // LEAD/TAIL static leaves, assembled by i18n/compose.ts — NOT an
+    // interpolation function in the dictionary. theming-and-i18n.md forbids the
+    // latter, and the reason is invisible rather than cosmetic: the message-key
+    // whitelist admits STRING leaves only, so every word inside a template
+    // function is unreachable by a theme's wording overlay AND absent from the
+    // generated key list, which leaves the drift gate green while the sentence
+    // is silently un-overridable.
+    throttledLead: "Too many failed attempts. Try again in",
+    throttledTail: "s.",
+    // Shown when a refused sign-in turns out to be a MISSING code rather than a
+    // wrong password — i.e. this wall was out of date and has just grown its
+    // code field. It must explain why the field appeared, or the owner reads it
+    // as the password having been wrong.
+    codeNowRequired:
+      "This server now asks for a code as well. Enter the one in your authenticator app.",
   },
   firstRun: {
     title: "Set the admin password",
@@ -606,6 +630,46 @@ export const en: Dict = {
     pwdErrorCurrent: "That current password is wrong",
     pwdErrorTooShort: "The new password needs at least 8 characters",
     pwdErrorMismatch: "The two new passwords don't match",
+    // 429 from the shared credential-attempt brake. Without its own branch this
+    // renders as "that current password is wrong", so an owner who fumbled a few
+    // logins is told their CORRECT password is wrong for up to five minutes.
+    pwdErrorThrottled: "Too many failed attempts — wait a moment and retry",
+    // ── second factor (TOTP) ──
+    mfa: "Two-factor authentication",
+    mfaSubOff: "Off — your password is the only key",
+    mfaSubOn: "On — an authenticator code is required to sign in",
+    mfaIntro:
+      "Add a code from your phone's authenticator app to every sign-in. Recommended if this server is reachable from outside your machine.",
+    mfaEnrollStart: "Set up two-factor",
+    mfaEnrollStarting: "Preparing…",
+    mfaScanHint:
+      "Add this to your authenticator app, then enter the code it shows to confirm.",
+    mfaSecretLabel: "Setup key",
+    mfaOpenInApp: "Open in authenticator app",
+    mfaCodePlaceholder: "6-digit code",
+    // Activating now re-proves the password, because arming a factor is as
+    // destructive as removing one — a stolen session must not be able to do it.
+    mfaActivateHint:
+      "Confirm with your password and the code from your authenticator.",
+    mfaErrorActivate: "That password or code is wrong",
+    // A 401 that is really a dead session, not a bad credential. These forms
+    // deliberately do not bounce to the login wall on 401 (a wrong credential
+    // must stay an inline error), so an expired token needs saying out loud.
+    mfaErrorSession: "Your session expired — sign in again",
+    mfaActivate: "Confirm and turn on",
+    mfaActivating: "Confirming…",
+    mfaActivated: "Two-factor is on",
+    mfaDisable: "Turn off two-factor",
+    mfaDisableHint:
+      "Confirm with your password and a current code. If you have lost your authenticator, run `ocserverd mfa-disable` on this machine instead.",
+    mfaDisabling: "Turning off…",
+    mfaDisabled: "Two-factor is off",
+    mfaErrorDisable: "That password or code is wrong",
+    // A DIFFERENT failure from a wrong code: the view could not read the
+    // current state at all, so it does not know what to offer. Saying "that
+    // code is wrong" here would name a code the owner never submitted.
+    mfaErrorLoad: "Could not read the two-factor status",
+    mfaRetry: "Try again",
   },
   chat: {
     offlineTitleSuffix: "is offline",

@@ -114,6 +114,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/mfa/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Arm the second factor by proving a code from the pending secret.
+         * @description Prove a pending TOTP enrolment and arm the second factor (owner-gated).
+         *
+         *     On success the pending secret becomes the active one, the pending slot is cleared, and `/api/login` demands a code from the next login onward. Existing owner tokens are deliberately NOT revoked: the session doing this just proved the password (to log in) and now the code as well, so it is the most strongly authenticated session on the install — logging it out would be theatre.
+         *
+         *     409 when there is no pending secret to prove, or when a factor is already active. A wrong code is 401 and leaves the pending secret intact for a retry.
+         */
+        post: operations["handle_mfa_activate_api_auth_mfa_activate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/mfa/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Turn the second factor off (password + live code required).
+         * @description Disarm the TOTP second factor (owner-gated), clearing the active secret, any pending secret and the replay floor.
+         *
+         *     BOTH the current password and a live code are required. An owner-gated session is deliberately not enough on its own: a factor that a stolen session can switch off protects nothing after the session is stolen.
+         *
+         *     This is therefore NOT the lost-phone recovery path — an owner who cannot generate a code cannot use this endpoint at all. Recovery is the local `ocserverd mfa-disable` command, which substitutes proof of HOST SHELL ACCESS for proof of the factor. That is the same trust substitution the first-run claim token already makes, rather than a new backdoor.
+         *
+         *     409 when no factor is active; 401 on a wrong password or code.
+         */
+        post: operations["handle_mfa_disable_api_auth_mfa_disable_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/mfa/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Begin TOTP enrolment: mint a pending secret + otpauth URI.
+         * @description Mint a PENDING TOTP secret and return it once, with its `otpauth://` URI, so the owner can add it to an authenticator app (owner-gated).
+         *
+         *     This does NOT arm the second factor. The secret sits in a pending slot until `…/mfa/activate` proves a code generated from it; only then does it become active. That two-step shape is the whole safety property: enrolling straight into the active slot would let a mis-scanned QR lock the owner out of their own server on the very next login, with no way back except host shell access.
+         *
+         *     Calling this again REPLACES any unproven pending secret (the previous one becomes unusable), so an owner who lost the enrolment screen simply starts over. It is refused with 409 while a factor is already active — rotating an armed secret means disabling it first, which requires proving the old one.
+         */
+        post: operations["handle_mfa_enroll_api_auth_mfa_enroll_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/set-password": {
         parameters: {
             query?: never;
@@ -150,9 +224,12 @@ export interface paths {
         };
         /**
          * First-run probe: has the owner password been set?
-         * @description First-run probe: whether an owner password has been set (PUBLIC — the UI
-         *     branches first-run setup vs login on this single bit; nothing else about the
-         *     auth state is disclosed).
+         * @description Pre-auth probe (PUBLIC): whether an owner password has been set, and whether
+         *     the login wall must also collect a TOTP code. The UI branches first-run setup
+         *     vs login on `password_set` and renders its code field from `mfa_required`; see
+         *     AuthStatusDTO for why that second bit is disclosed to an unauthenticated
+         *     caller. Nothing else about the auth state is disclosed — never the secret, the
+         *     replay floor, or the attempt budget.
          */
         get: operations["handle_auth_status_api_auth_status_get"];
         put?: never;
@@ -1136,15 +1213,28 @@ export interface paths {
          * Owner login: exchange the password for an owner-scoped JWT.
          * @description Exchange the owner password for an owner-scoped JWT (M1 §3.5).
          *
-         *     The single PUBLIC business entry point. The submitted password is compared
-         *     (constant-time) against the configured `[auth].password`; on a match an
-         *     HS256 JWT scoped to the single owner (`sub = DEFAULT_OWNER`, `scope=owner`)
-         *     is minted with the configured TTL, and is thereafter the one credential for
-         *     REST / MCP / SSE. A wrong password — or no password configured at all
+         *     The single PUBLIC business entry point. The submitted password is verified
+         *     against the argon2id hash in the DB settings table (`auth.password_hash`); on
+         *     a match an HS256 JWT scoped to the single owner (`sub = DEFAULT_OWNER`,
+         *     `scope=owner`) is minted with the configured TTL, and is thereafter the one
+         *     credential for REST / MCP / SSE. A wrong password — or no password set at all
          *     (deny-by-default) — is a flat 401, with no hint which it was.
          *
-         *     The signing secret and the expected password are resolved once at
-         *     `create_app` time and held on `app.state`; this handler never sees a
+         *     While the owner has a TOTP secret enrolled (`GET /api/auth/status` →
+         *     `mfa_required`), a correct password is NOT sufficient: `code` must also verify,
+         *     and its absence or a wrong value is the same flat 401. A code is single-use —
+         *     replaying one inside its ~90s acceptance window is refused.
+         *
+         *     Every failed attempt — wrong password AND wrong code alike — spends from a
+         *     server-wide credential-attempt budget. Past a small free allowance the next
+         *     attempt is refused with 429 and a `Retry-After` header, backing off
+         *     exponentially to a cap; a success clears the history. The budget is
+         *     SERVER-WIDE rather than per-client on purpose: the server binds loopback, so
+         *     every remote caller arrives through a tunnel and is indistinguishable by
+         *     address.
+         *
+         *     The signing secret and the password hash are loaded from the DB settings table
+         *     at boot and updated in place by the owner endpoints; this handler never sees a
          *     hard-coded secret.
          */
         post: operations["handle_login_api_login_post"];
@@ -4272,8 +4362,16 @@ export interface components {
          * @description First-run probe (`GET /api/auth/status`, PUBLIC): whether an owner password
          *     has been set. The UI branches first-run setup vs login on this; /api/login
          *     itself stays a flat 401 either way and never discloses the first-run state.
+         *
+         *     `mfa_required` says whether the login wall must also collect a TOTP code. It is disclosed to an unauthenticated caller DELIBERATELY: the wall has to render the right number of fields before anyone has a token, and the alternative (a distinguishable "password ok, code missing" refusal) discloses strictly more — it confirms a correct password. What leaks here is one bit an attacker learns from a single login attempt anyway.
          */
         AuthStatusDTO: {
+            /**
+             * Mfa Required
+             * @description Whether an active TOTP secret is enrolled, i.e. whether `/api/login` demands a `code`. Optional for compatibility: a client that does not read it, or an older server that does not send it, behaves exactly as before.
+             * @default false
+             */
+            mfa_required: boolean;
             /** Password Set */
             password_set: boolean;
         };
@@ -5425,10 +5523,70 @@ export interface components {
         /**
          * LoginDTO
          * @description Owner login request: the password exchanged at `/api/login` for a JWT.
+         *
+         *     `code` is the TOTP second factor, and it is OPTIONAL in the schema on purpose — it is required by SERVER STATE, not by the wire. While the owner has no TOTP secret enrolled it must be absent (or null) and is ignored; once enrolled, a login without it is a flat 401. Making it schema-required would break every existing client on an install that never turned MFA on.
          */
         LoginDTO: {
+            /**
+             * Code
+             * @description TOTP code from the owner's authenticator app. Required only while MFA is enrolled (`GET /api/auth/status` → `mfa_required`). Separators are tolerated: "123 456" verifies the same as "123456".
+             */
+            code?: string;
             /** Password */
             password: string;
+        };
+        /**
+         * MfaActivateDTO
+         * @description Prove a pending TOTP enrolment and ARM the second factor (`POST /api/auth/mfa/activate`, owner-gated). The code must verify against the secret `…/mfa/enroll` handed out; on success that secret becomes the ACTIVE one and the second factor is armed from the next login onward. A wrong code or password leaves the pending secret in place so the owner can simply try again.
+         *
+         *     🔴 `password` IS REQUIRED, and the owner token alone is deliberately not enough. Arming a factor is as destructive as removing one: an attacker holding only a stolen owner token could otherwise enrol a secret THEY control and activate it, after which the real owner's password yields 401 and they cannot disable it (that needs a live code from the attacker's authenticator) — a transient token theft turned into a durable lockout recoverable only from a host shell. The same reasoning that makes `…/mfa/disable` demand both factors applies symmetrically to arming.
+         */
+        MfaActivateDTO: {
+            /**
+             * Code
+             * @description TOTP code generated from the pending secret. Separators are tolerated.
+             */
+            code: string;
+            /**
+             * Password
+             * @description The current owner password. Re-proved here so a stolen session cannot arm a factor the owner does not hold.
+             */
+            password: string;
+        };
+        /**
+         * MfaDisableDTO
+         * @description Turn the second factor off (`POST /api/auth/mfa/disable`, owner-gated). BOTH the current password and a live TOTP code are required: an owner-gated session alone must not be able to strip MFA, because the whole point of the factor is to survive a stolen session. An owner who has LOST their authenticator cannot satisfy this by design — that recovery path is the local `ocserverd mfa-disable` command, which proves host shell access instead.
+         */
+        MfaDisableDTO: {
+            /**
+             * Code
+             * @description Live TOTP code from the enrolled authenticator. Separators are tolerated.
+             */
+            code: string;
+            /** Password */
+            password: string;
+        };
+        /**
+         * MfaStateDTO
+         * @description The owner's second-factor state, answered by every `/api/auth/mfa/*` write.
+         *
+         *     `enrolled` is the armed bit — true only once a pending secret has been PROVEN by `…/activate`.
+         *
+         *     `secret` and `otpauth_uri` are non-null ONLY in the response to `…/enroll`, and only for the pending (not yet armed) secret. They are the one moment the secret crosses the wire, because an authenticator app cannot be enrolled without it; the server never echoes an ACTIVE secret back afterwards, so a stolen owner token cannot read out an existing enrolment and clone it.
+         */
+        MfaStateDTO: {
+            /** Enrolled */
+            enrolled: boolean;
+            /**
+             * Otpauth Uri
+             * @description The `otpauth://totp/…` URI for a pending enrolment (QR / deep-link form), else null.
+             */
+            otpauth_uri: string | null;
+            /**
+             * Secret
+             * @description The base32 secret for a pending enrolment, for manual entry into an authenticator app; null otherwise.
+             */
+            secret: string | null;
         };
         /**
          * MachineClaimDTO
@@ -9563,6 +9721,155 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TokenDTO"];
+                };
+            };
+            /** @description Validation error (unified error envelope). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Client error (unified error envelope). */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Server error (unified error envelope). */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+        };
+    };
+    handle_mfa_activate_api_auth_mfa_activate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaActivateDTO"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStateDTO"];
+                };
+            };
+            /** @description Validation error (unified error envelope). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Client error (unified error envelope). */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Server error (unified error envelope). */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+        };
+    };
+    handle_mfa_disable_api_auth_mfa_disable_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaDisableDTO"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStateDTO"];
+                };
+            };
+            /** @description Validation error (unified error envelope). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Client error (unified error envelope). */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+            /** @description Server error (unified error envelope). */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelopeDTO"];
+                };
+            };
+        };
+    };
+    handle_mfa_enroll_api_auth_mfa_enroll_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStateDTO"];
                 };
             };
             /** @description Validation error (unified error envelope). */

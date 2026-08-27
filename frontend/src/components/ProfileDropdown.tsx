@@ -1,7 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useI18n } from "../i18n";
 import { api } from "../api";
-import { isHttpStatus } from "../api/errors";
+import { isHttpStatus, retryAfterSeconds } from "../api/errors";
+import type { MfaEnrollView } from "../types";
 import {
   adoptServerSettings,
   loadServerSettings,
@@ -30,7 +31,7 @@ interface ProfileDropdownProps {
   setOwnerName: (next: string) => void;
 }
 
-type View = "main" | "preferences" | "password" | "notifications";
+type View = "main" | "preferences" | "password" | "notifications" | "mfa";
 
 /**
  * Profile menu that drops from the topbar profile pill.
@@ -66,8 +67,7 @@ export function ProfileDropdown({
     setLanguage,
     wide,
     setWide,
-    resetPreferences,
-  } = useI18n();
+    resetPreferences, msg } = useI18n();
 
   const [view, setView] = useState<View>("main");
 
@@ -78,13 +78,62 @@ export function ProfileDropdown({
   const [pwdBusy, setPwdBusy] = useState(false);
   const [pwdDone, setPwdDone] = useState(false);
   const [pwdError, setPwdError] = useState<
-    "" | "current" | "short" | "mismatch"
+    "" | "current" | "short" | "mismatch" | "throttled"
   >("");
+  /** Seconds from a 429 on change-password (the shared credential brake). */
+  const [pwdRetryAfter, setPwdRetryAfter] = useState(0);
+  // ── second-factor (TOTP) state ────────────────────────────────────────────
+  // `mfaEnrolled` is the ARMED bit, read from the public probe when this view
+  // opens rather than cached at mount: the owner may have armed the factor from
+  // another device, and a stale "off" here would offer to enrol a second time
+  // (which the server refuses with 409 — an error the owner did nothing to
+  // deserve).
+  // null = NOT READ YET, which is a third state and not a quieter "off". The
+  // row's subtitle is a security claim: rendering "Off — your password is the
+  // only key" from an unread default tells an owner whose factor IS armed the
+  // exact opposite of the truth, on every fresh mount of the menu.
+  const [mfaEnrolled, setMfaEnrolled] = useState<boolean | null>(null);
+  const [mfaLoaded, setMfaLoaded] = useState(false);
+  // The PENDING enrolment, held in component state ONLY — never persisted. It
+  // is the one moment a secret exists on this client, and it dies with the view.
+  const [mfaPending, setMfaPending] = useState<MfaEnrollView | null>(null);
+  const [mfaCode, setMfaCode] = useState("");
+  // ONE password field serves both the activate and the disable forms — they are
+  // never on screen at the same time (the panels are mutually exclusive on
+  // mfaEnrolled), and openMfaView clears it on every entry.
+  const [mfaPwd, setMfaPwd] = useState("");
+  const [mfaBusy, setMfaBusy] = useState(false);
+  const [mfaNotice, setMfaNotice] = useState<"" | "activated" | "disabled">("");
+  const [mfaError, setMfaError] = useState<
+    "" | "code" | "disable" | "load" | "throttled" | "session"
+  >("");
+  /** Seconds from a 429's Retry-After, for the throttled message. */
+  const [mfaRetryAfter, setMfaRetryAfter] = useState(0);
   const [pushContactEmail, setPushContactEmail] = useState("");
   const [savedPushContactEmail, setSavedPushContactEmail] = useState("");
   const [pushEmailLoaded, setPushEmailLoaded] = useState(false);
   const [pushEmailSaving, setPushEmailSaving] = useState(false);
   const [pushEmailError, setPushEmailError] = useState(false);
+
+  // The armed bit for the main-menu subtitle. Read from the PUBLIC probe, which
+  // needs no token and is the same source the login wall branches on, so the
+  // row cannot disagree with the wall. Left null on failure — the subtitle then
+  // says nothing rather than guessing.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api
+      .getAuthStatus()
+      .then((status) => {
+        if (!cancelled) setMfaEnrolled(status.mfaRequired);
+      })
+      .catch(() => {
+        if (!cancelled) setMfaEnrolled(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   // Reset transient view state whenever the menu is (re)opened.
   useEffect(() => {
@@ -113,6 +162,119 @@ export function ProfileDropdown({
     setPwdDone(false);
     setPwdBusy(false);
     setView("password");
+  }
+
+  /**
+   * Turn a rejection from a credentialPost seam into the right error key.
+   *
+   * 🔴 THE 401 IS AMBIGUOUS ON THESE TWO ENDPOINTS, and that ambiguity was a
+   * trap. activateMfa / disableMfa deliberately ride `credentialPost`, which
+   * skips the auth-expiry middleware so a WRONG CREDENTIAL stays an inline error
+   * instead of bouncing the whole app to the login wall. The cost is that a 401
+   * from the auth GATE — an owner token that expired while the form sat open —
+   * looks identical, and used to render as "that code is wrong", forever, for a
+   * code that was perfectly correct. Only a page reload escaped, and nothing on
+   * screen suggested it.
+   *
+   * Rather than sniff the server's message text (which the wire deliberately
+   * keeps identical for both credential halves, and which is localisable), it
+   * asks a cheap GATED question through the TYPED client. If the session really
+   * is dead that call 401s and the client's own middleware fires
+   * `oc-auth-expired`, which bounces the app — so the honest outcome happens by
+   * itself and we only need a message for the moment before it lands.
+   */
+  async function classifyCredentialError(
+    err: unknown,
+    credentialKey: "code" | "disable",
+  ): Promise<"code" | "disable" | "throttled" | "session"> {
+    // The brake, not a credential: it says nothing about what was submitted.
+    if (isHttpStatus(err, 429)) {
+      setMfaRetryAfter(retryAfterSeconds(err));
+      return "throttled";
+    }
+    if (isHttpStatus(err, 401)) {
+      try {
+        await loadServerSettings(); // typed client: 401 here bounces the app
+      } catch (probe) {
+        if (isHttpStatus(probe, 401)) return "session";
+      }
+    }
+    return credentialKey;
+  }
+
+  async function openMfaView() {
+    setMfaPending(null);
+    setMfaCode("");
+    setMfaPwd("");
+    setMfaRetryAfter(0);
+    setMfaBusy(false);
+    setMfaNotice("");
+    setMfaError("");
+    setMfaLoaded(false);
+    setView("mfa");
+    try {
+      const status = await api.getAuthStatus();
+      setMfaEnrolled(status.mfaRequired);
+      setMfaLoaded(true);
+    } catch {
+      // HONEST: no guess. Without knowing the current state this view cannot
+      // offer the right action, so it says so instead of showing a wrong one.
+      setMfaLoaded(false);
+      setMfaError("load");
+    }
+  }
+
+  async function handleMfaEnroll() {
+    if (mfaBusy) return;
+    setMfaBusy(true);
+    setMfaError("");
+    try {
+      setMfaPending(await api.enrollMfa());
+      setMfaCode("");
+    } catch {
+      setMfaError("load");
+    } finally {
+      setMfaBusy(false);
+    }
+  }
+
+  async function handleMfaActivate(e: FormEvent) {
+    e.preventDefault();
+    if (mfaBusy || !mfaCode || !mfaPwd) return;
+    setMfaBusy(true);
+    setMfaError("");
+    try {
+      await api.activateMfa(mfaPwd, mfaCode);
+      // The secret and the password have served their only purpose — drop both
+      // from memory the instant the factor is armed.
+      setMfaPending(null);
+      setMfaCode("");
+      setMfaPwd("");
+      setMfaEnrolled(true);
+      setMfaNotice("activated");
+    } catch (err) {
+      setMfaError(await classifyCredentialError(err, "code"));
+    } finally {
+      setMfaBusy(false);
+    }
+  }
+
+  async function handleMfaDisable(e: FormEvent) {
+    e.preventDefault();
+    if (mfaBusy || !mfaPwd || !mfaCode) return;
+    setMfaBusy(true);
+    setMfaError("");
+    try {
+      await api.disableMfa(mfaPwd, mfaCode);
+      setMfaEnrolled(false);
+      setMfaNotice("disabled");
+      setMfaPwd("");
+      setMfaCode("");
+    } catch (err) {
+      setMfaError(await classifyCredentialError(err, "disable"));
+    } finally {
+      setMfaBusy(false);
+    }
   }
 
   async function loadPushContactEmail() {
@@ -175,7 +337,16 @@ export function ProfileDropdown({
       setNewPwd("");
       setConfirmPwd("");
     } catch (err) {
-      setPwdError(isHttpStatus(err, 422) ? "short" : "current");
+      // 429 is the shared credential-attempt brake — this endpoint spends from
+      // the same budget as login. Without this branch it renders as "that
+      // current password is wrong", so an owner who fumbled a few logins is
+      // told their CORRECT password is wrong for up to five minutes.
+      if (isHttpStatus(err, 429)) {
+        setPwdRetryAfter(retryAfterSeconds(err));
+        setPwdError("throttled");
+      } else {
+        setPwdError(isHttpStatus(err, 422) ? "short" : "current");
+      }
     } finally {
       setPwdBusy(false);
     }
@@ -231,6 +402,12 @@ export function ProfileDropdown({
           <button type="button" className="profile-dd__row" onClick={openPasswordView}>
             <span className="profile-dd__row-icon"><GearIcon size={16} /></span>
             <span className="profile-dd__row-body"><span className="profile-dd__row-title">{t.profile.changePassword}</span><span className="profile-dd__row-sub">{t.profile.changePasswordSub}</span></span>
+            <ChevronRightIcon size={16} className="profile-dd__row-chevron" />
+          </button>
+
+          <button type="button" className="profile-dd__row" onClick={openMfaView}>
+            <span className="profile-dd__row-icon"><GearIcon size={16} /></span>
+            <span className="profile-dd__row-body"><span className="profile-dd__row-title">{t.profile.mfa}</span><span className="profile-dd__row-sub">{mfaEnrolled === null ? "" : mfaEnrolled ? t.profile.mfaSubOn : t.profile.mfaSubOff}</span></span>
             <ChevronRightIcon size={16} className="profile-dd__row-chevron" />
           </button>
 
@@ -344,6 +521,188 @@ export function ProfileDropdown({
         </>
       )}
 
+      {view === "mfa" && (
+        <>
+          <button
+            type="button"
+            className="profile-dd__back"
+            onClick={() => setView("main")}
+          >
+            <ChevronLeftIcon size={16} />
+            <span>{t.profile.mfa}</span>
+          </button>
+
+          {/* HONEST: the probe failed, so we do not know the current state and
+              will not guess at an action that might be the wrong one. Its own
+              sentence, not the wrong-code one — no code was ever submitted on
+              this path — plus the retry that is otherwise missing (the only way
+              out was Back-then-reopen, which nothing on screen suggested). */}
+          {mfaError === "load" && !mfaPending && (
+            <div className="profile-dd__form">
+              <div className="profile-dd__error">{t.profile.mfaErrorLoad}</div>
+              <button
+                type="button"
+                className="profile-dd__submit"
+                disabled={mfaBusy}
+                onClick={openMfaView}
+              >
+                {t.profile.mfaRetry}
+              </button>
+            </div>
+          )}
+          {mfaError === "throttled" && (
+            <div className="profile-dd__error">
+              {msg.loginThrottled(mfaRetryAfter)}
+            </div>
+          )}
+
+          {mfaNotice === "activated" && (
+            <div className="profile-dd__success">{t.profile.mfaActivated}</div>
+          )}
+          {mfaNotice === "disabled" && (
+            <div className="profile-dd__success">{t.profile.mfaDisabled}</div>
+          )}
+
+          {/* ── OFF, nothing pending: offer to start ── */}
+          {mfaLoaded && mfaEnrolled === false && !mfaPending && (
+            <div className="profile-dd__form">
+              <div className="profile-dd__hint">{t.profile.mfaIntro}</div>
+              <button
+                type="button"
+                className="profile-dd__submit"
+                disabled={mfaBusy}
+                onClick={handleMfaEnroll}
+              >
+                {mfaBusy ? t.profile.mfaEnrollStarting : t.profile.mfaEnrollStart}
+              </button>
+            </div>
+          )}
+
+          {/* ── PENDING: show the secret once, take a code to prove it ── */}
+          {mfaPending && (
+            <form className="profile-dd__form" onSubmit={handleMfaActivate}>
+              <div className="profile-dd__hint">{t.profile.mfaScanHint}</div>
+              {/* The secret is shown as selectable text, not a QR: this menu has
+                  no QR renderer and adding an image dependency for one screen is
+                  not worth it. The otpauth link below does the same job on the
+                  device most owners will use. */}
+              <div className="profile-dd__hint">
+                {t.profile.mfaSecretLabel}
+              </div>
+              <code className="profile-dd__code">{mfaPending.secret}</code>
+              <a
+                className="profile-dd__link"
+                href={mfaPending.otpauthUri}
+                rel="noreferrer"
+              >
+                {t.profile.mfaOpenInApp}
+              </a>
+              <div className="profile-dd__hint">{t.profile.mfaActivateHint}</div>
+              <input
+                className="profile-dd__input"
+                type="password"
+                autoComplete="current-password"
+                placeholder={t.profile.currentPasswordPlaceholder}
+                aria-label={t.profile.currentPasswordPlaceholder}
+                value={mfaPwd}
+                disabled={mfaBusy}
+                onChange={(e) => {
+                  setMfaPwd(e.target.value);
+                  setMfaError("");
+                }}
+              />
+              <input
+                className="profile-dd__input"
+                type="text"
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                placeholder={t.profile.mfaCodePlaceholder}
+                aria-label={t.profile.mfaCodePlaceholder}
+                value={mfaCode}
+                disabled={mfaBusy}
+                onChange={(e) => {
+                  setMfaCode(e.target.value);
+                  setMfaError("");
+                }}
+              />
+              {mfaError === "code" && (
+                <div className="profile-dd__error">
+                  {t.profile.mfaErrorActivate}
+                </div>
+              )}
+              {mfaError === "throttled" && (
+                <div className="profile-dd__error">
+                  {msg.loginThrottled(mfaRetryAfter)}
+                </div>
+              )}
+              {mfaError === "session" && (
+                <div className="profile-dd__error">
+                  {t.profile.mfaErrorSession}
+                </div>
+              )}
+              <button
+                type="submit"
+                className="profile-dd__submit"
+                disabled={mfaBusy || !mfaCode || !mfaPwd}
+              >
+                {mfaBusy ? t.profile.mfaActivating : t.profile.mfaActivate}
+              </button>
+            </form>
+          )}
+
+          {/* ── ON: disarming needs BOTH the password and a live code ── */}
+          {mfaLoaded && mfaEnrolled === true && !mfaPending && (
+            <form className="profile-dd__form" onSubmit={handleMfaDisable}>
+              <div className="profile-dd__hint">{t.profile.mfaDisableHint}</div>
+              <input
+                className="profile-dd__input"
+                type="password"
+                autoComplete="current-password"
+                placeholder={t.profile.currentPasswordPlaceholder}
+                aria-label={t.profile.currentPasswordPlaceholder}
+                value={mfaPwd}
+                disabled={mfaBusy}
+                onChange={(e) => {
+                  setMfaPwd(e.target.value);
+                  setMfaError("");
+                }}
+              />
+              <input
+                className="profile-dd__input"
+                type="text"
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                placeholder={t.profile.mfaCodePlaceholder}
+                aria-label={t.profile.mfaCodePlaceholder}
+                value={mfaCode}
+                disabled={mfaBusy}
+                onChange={(e) => {
+                  setMfaCode(e.target.value);
+                  setMfaError("");
+                }}
+              />
+              {mfaError === "disable" && (
+                <div className="profile-dd__error">
+                  {t.profile.mfaErrorDisable}
+                </div>
+              )}
+              {mfaError === "session" && (
+                <div className="profile-dd__error">
+                  {t.profile.mfaErrorSession}
+                </div>
+              )}
+              <button
+                type="submit"
+                className="profile-dd__submit profile-dd__submit--danger"
+                disabled={mfaBusy || !mfaPwd || !mfaCode}
+              >
+                {mfaBusy ? t.profile.mfaDisabling : t.profile.mfaDisable}
+              </button>
+            </form>
+          )}
+        </>
+      )}
+
       {view === "password" && (
         <>
           <button
@@ -406,6 +765,7 @@ export function ProfileDropdown({
                     current: t.profile.pwdErrorCurrent,
                     short: t.profile.pwdErrorTooShort,
                     mismatch: t.profile.pwdErrorMismatch,
+                    throttled: msg.loginThrottled(pwdRetryAfter),
                   }[pwdError]
                 }
               </div>

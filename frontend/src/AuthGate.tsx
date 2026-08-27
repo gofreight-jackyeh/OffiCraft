@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import App from "./App";
 import { LoginPage } from "./components/LoginPage";
 import { FirstRunPage } from "./components/FirstRunPage";
@@ -26,6 +26,20 @@ export function AuthGate() {
   const [wall, setWall] = useState<Wall>(() =>
     USE_MOCK || hasToken() ? "app" : "checking"
   );
+  // Whether the login wall must also collect a TOTP code. It comes from the
+  // SAME probe that decides first-run vs login, so the wall renders the right
+  // fields on its first paint — there is no authenticated call available
+  // before login that could answer this.
+  //
+  // 🔴 THEREFORE EVERY ROUTE TO THE LOGIN WALL MUST GO VIA "checking", never
+  // straight to "login". This bit is only ever written by the probe below, so a
+  // path that jumps to the wall directly carries whatever value the tab last
+  // had — and a tab that BEGAN logged in never probed at all, so it carries
+  // `false`. That produced a login wall with no code field after logout: the
+  // owner typed the right password, got a flat 401, and was told the password
+  // was wrong, with no way to enter a code short of a page reload. Logout and
+  // the auth-expired handler both go through "checking" for this reason.
+  const [mfaRequired, setMfaRequired] = useState(false);
 
   // Real-mode-only: resolve the "checking" wall via the first-run probe.
   useEffect(() => {
@@ -33,8 +47,10 @@ export function AuthGate() {
     let cancelled = false;
     api
       .getAuthStatus()
-      .then((passwordSet) => {
-        if (!cancelled) setWall(passwordSet ? "login" : "firstrun");
+      .then((status) => {
+        if (cancelled) return;
+        setMfaRequired(status.mfaRequired);
+        setWall(status.passwordSet ? "login" : "firstrun");
       })
       .catch(() => {
         if (!cancelled) setWall("login");
@@ -46,15 +62,36 @@ export function AuthGate() {
 
   // Real-mode-only: a gated call that hit 401 (expired/missing owner token) has
   // already cleared the token and fired "oc-auth-expired" (see api/http.ts). Drop
-  // the wall back to LoginPage so the owner re-logs in — instead of a silently
+  // the wall back to the PROBE so the owner re-logs in — instead of a silently
   // empty office masquerading as a real empty state. Mock mode has no real 401
   // and stays on "app" permanently, so we never touch it (byte-for-byte).
   useEffect(() => {
     if (USE_MOCK) return;
-    const onExpired = () => setWall("login");
+    const onExpired = () => setWall("checking");
     window.addEventListener("oc-auth-expired", onExpired);
     return () => window.removeEventListener("oc-auth-expired", onExpired);
   }, []);
+
+  // Re-read the PUBLIC probe and answer whether a code is required now.
+  //
+  // The wall calls this when a login is refused while it is NOT showing a code
+  // field — the exact signature of a wall that is out of date, which happens
+  // two ways: the owner armed the factor on another device while this tab sat
+  // here, or the first-paint probe failed and left the default `false`. Without
+  // it both end in "wrong password, try again" forever, with the real cause
+  // invisible and only a page reload as the way out.
+  //
+  // A failed probe returns the CURRENT value rather than guessing: the login
+  // error the caller is already handling stays the honest thing on screen.
+  const refreshMfaRequired = useCallback(async (): Promise<boolean> => {
+    try {
+      const status = await api.getAuthStatus();
+      setMfaRequired(status.mfaRequired);
+      return status.mfaRequired;
+    } catch {
+      return mfaRequired;
+    }
+  }, [mfaRequired]);
 
   if (wall === "checking") return null; // one probe round-trip, no flash
   if (wall === "firstrun") {
@@ -66,7 +103,13 @@ export function AuthGate() {
     );
   }
   if (wall === "login") {
-    return <LoginPage onSuccess={() => setWall("app")} />;
+    return (
+      <LoginPage
+        onSuccess={() => setWall("app")}
+        mfaRequired={mfaRequired}
+        refreshMfaRequired={refreshMfaRequired}
+      />
+    );
   }
 
   // ReplyCardsProvider is mounted here — ABOVE the nav badge AND the 等我回覆
@@ -77,7 +120,10 @@ export function AuthGate() {
       <App
         onLogout={() => {
           clearToken();
-          setWall(USE_MOCK ? "app" : "login");
+          // "checking", not "login" — the probe has to run so the wall knows
+          // whether to render a code field (see the note on mfaRequired). Mock
+          // mode has no wall and stays on "app", byte-for-byte as before.
+          setWall(USE_MOCK ? "app" : "checking");
         }}
       />
     </ReplyCardsProvider>

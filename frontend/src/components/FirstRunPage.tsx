@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useI18n } from "../i18n";
 import { api } from "../api";
-import { isHttpStatus } from "../api/errors";
+import { isHttpStatus, retryAfterSeconds } from "../api/errors";
 import { LogoMark } from "./icons";
 import "./login.css";
 
@@ -31,12 +31,16 @@ export function FirstRunPage({
   onSuccess: () => void;
   onGotoLogin: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, msg } = useI18n();
   const [claimToken, setClaimToken] = useState(readClaimCodeFromURL);
   const [prefilled] = useState(() => claimToken !== "");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState<"" | "claim" | "short" | "mismatch" | "taken">("");
+  const [error, setError] = useState<
+    "" | "claim" | "short" | "mismatch" | "taken" | "throttled"
+  >("");
+  /** Seconds from a 429's Retry-After (the shared credential-attempt brake). */
+  const [retryAfter, setRetryAfter] = useState(0);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -69,13 +73,22 @@ export function FirstRunPage({
     } catch (err) {
       if (isHttpStatus(err, 409)) setError("taken");
       else if (isHttpStatus(err, 422)) setError("short");
-      else setError("claim"); // 401 wrong claim token (or unreachable server)
+      // 429 is the credential-attempt brake: the claim token is now throttled
+      // (it is a secret an unauthenticated caller submits, so it shares login's
+      // budget). Without this branch a first-run owner who fumbled a few times
+      // is told their CORRECT token is wrong, with no wait shown and no reason
+      // to try the same token again.
+      else if (isHttpStatus(err, 429)) {
+        setRetryAfter(retryAfterSeconds(err));
+        setError("throttled");
+      } else setError("claim"); // 401 wrong claim token (or unreachable server)
       setBusy(false);
     }
   }
 
   const errorText = {
     "": "",
+    throttled: msg.loginThrottled(retryAfter),
     claim: t.firstRun.errorClaim,
     short: t.firstRun.errorTooShort,
     mismatch: t.firstRun.errorMismatch,

@@ -147,9 +147,20 @@ func validatePushContactEmail(address string) error {
 	return nil
 }
 
-// GET /api/auth/status — PUBLIC: the single first-run bit the UI branches on.
+// GET /api/auth/status — PUBLIC: the two pre-auth bits the login wall branches
+// on. `password_set` picks first-run setup vs login; `mfa_required` decides
+// whether the wall renders a code field.
+//
+// Disclosing `mfa_required` to an unauthenticated caller is deliberate. The wall
+// must render the right fields before anyone holds a token, and the alternative
+// — a distinguishable "password accepted, code missing" refusal — leaks strictly
+// MORE, because it confirms a correct password. This leaks one bit that a single
+// login attempt would reveal anyway.
 func (s *apiServer) HandleAuthStatusApiAuthStatusGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, authStatusDTO{PasswordSet: s.authPasswordHash() != ""})
+	writeJSON(w, http.StatusOK, authStatusDTO{
+		PasswordSet: s.authPasswordHash() != "",
+		MFARequired: s.authMFAEnrolled(),
+	})
 }
 
 // POST /api/auth/set-password — PUBLIC, gated by the one-shot claim token
@@ -171,6 +182,23 @@ func (s *apiServer) HandleSetPasswordApiAuthSetPasswordPost(w http.ResponseWrite
 		writeError(w, http.StatusConflict, "a password is already set")
 		return
 	}
+	// 🔴 THE THROTTLE SITS *AFTER* THE 409, NOT BEFORE IT, and the order is the
+	// contract. The already-set path never consults the claim token, so nothing
+	// is being guessed on it and there is nothing to throttle; gating it would
+	// turn a documented 409 into a 429 (measured: it broke
+	// test_set_password_after_set_conflicts). The brake belongs on the ONE
+	// comparison that is a guessing oracle — the token check below.
+	//
+	// The claim token is a 32-byte secret submitted by an unauthenticated
+	// caller, which makes it the same class of target as the password, so it
+	// shares login's budget (throttle.go). First-run and login never overlap in
+	// time, so one bucket costs the owner nothing.
+	release, wait, blocked := s.loginThrottle.begin(time.Now())
+	if blocked {
+		writeThrottled(w, wait)
+		return
+	}
+	defer release()
 	stored, err := s.dal.GetSetting(settingClaimToken)
 	if err != nil {
 		internalError(w, err)
@@ -178,9 +206,11 @@ func (s *apiServer) HandleSetPasswordApiAuthSetPasswordPost(w http.ResponseWrite
 	}
 	if stored == nil ||
 		subtle.ConstantTimeCompare([]byte(*stored), []byte(body.ClaimToken)) != 1 {
+		s.loginThrottle.noteFailure(time.Now())
 		writeError(w, http.StatusUnauthorized, "invalid claim token")
 		return
 	}
+	s.loginThrottle.noteSuccess()
 	phc, err := hashPassword(body.Password)
 	if err != nil {
 		internalError(w, err)
@@ -213,6 +243,22 @@ func (s *apiServer) HandleSetPasswordApiAuthSetPasswordPost(w http.ResponseWrite
 // response carries a fresh owner token (iat = the stamp) so the current
 // session survives its own change. Agent/warden tokens are untouched — the
 // signing secret never rotates here (B1 zero-invalidation).
+//
+// It deliberately does NOT also demand a TOTP code, unlike mfa/disable. While a
+// factor is armed, holding a live owner session already implies having passed
+// it, and a password change does not weaken the factor: the new password still
+// cannot be used to log in without a code, and the factor itself cannot be
+// removed here. mfa/disable is different precisely because it DOES remove the
+// factor, which is why that one re-proves it.
+//
+// 🔴 IT IS THROTTLED, and the reason is the one asymmetry above. Because no
+// code is demanded here, this is the ONE seam where a stolen owner token buys
+// unlimited guesses at the real password with the second factor standing aside
+// — and a successful guess is not a read, it is a takeover: rotating the
+// password stamps password_changed_at, which revokes the legitimate owner's
+// own tokens and leaves them locked out to a host shell. Sharing login's
+// budget costs the honest owner nothing (they know their password) and turns
+// that oracle into ~12 attempts an hour.
 func (s *apiServer) HandleChangePasswordApiAuthChangePasswordPost(w http.ResponseWriter, r *http.Request) {
 	var body ChangePasswordDTO
 	if !decodeJSONBodyRequired(w, r, &body, "current_password", "new_password") {
@@ -222,12 +268,20 @@ func (s *apiServer) HandleChangePasswordApiAuthChangePasswordPost(w http.Respons
 		writeError(w, http.StatusUnprocessableEntity, "new_password must be at least 8 characters")
 		return
 	}
+	release, wait, blocked := s.loginThrottle.begin(time.Now())
+	if blocked {
+		writeThrottled(w, wait)
+		return
+	}
+	defer release()
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
 	if s.passwordHash == "" || !verifyPassword(body.CurrentPassword, s.passwordHash) {
+		s.loginThrottle.noteFailure(time.Now())
 		writeError(w, http.StatusUnauthorized, "invalid password")
 		return
 	}
+	s.loginThrottle.noteSuccess()
 	phc, err := hashPassword(body.NewPassword)
 	if err != nil {
 		internalError(w, err)

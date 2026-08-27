@@ -11,6 +11,8 @@ import type {
   VersionView,
   ReleaseCheckView,
   BackupHealthView,
+  AuthStatusView,
+  MfaEnrollView,
   GlobalContextView,
   BootDocKind,
   BootDocView,
@@ -1717,6 +1719,18 @@ function resumeDisplayNameOf(id: string): string {
 // server so the UI's error paths are exercisable offline.
 let mockPasswordSet = true;
 let mockPassword = "mock-password";
+// The mock's TOTP state, mirroring the server's three settings keys. It boots
+// with NO factor armed, which is what a fresh install looks like.
+//
+// The mock cannot compute real TOTP codes (no crypto here, and a test that had
+// to generate one would be testing HMAC, not the UI). It accepts one fixed
+// code instead — the same substitution the mock already makes for the claim
+// token. What the UI needs to be exercisable offline is the STATE MACHINE
+// (pending → armed → off) and the refusals, and those are faithful.
+let mockMfaActive = false;
+let mockMfaPending = false;
+const MOCK_TOTP_CODE = "123456";
+const MOCK_TOTP_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const DEFAULT_MOCK_SETTINGS = {
   owner_token_ttl: 86400,
   agent_token_ttl: 604800,
@@ -4520,8 +4534,79 @@ export const mockApi: Api = {
     return toBackupHealth(wire);
   },
 
-  async getAuthStatus(): Promise<boolean> {
-    return mockPasswordSet;
+  async getAuthStatus(): Promise<AuthStatusView> {
+    return { passwordSet: mockPasswordSet, mfaRequired: mockMfaActive };
+  },
+
+  async enrollMfa(): Promise<MfaEnrollView> {
+    // Same check order as the server: an active factor is a 409 before any
+    // secret is minted (rotation must disable first).
+    if (mockMfaActive) {
+      throw mockApiError(
+        "http 409 for POST /api/auth/mfa/enroll",
+        409,
+        "a second factor is already active; disable it first"
+      );
+    }
+    mockMfaPending = true;
+    return {
+      secret: MOCK_TOTP_SECRET,
+      otpauthUri: `otpauth://totp/OffiCraft:owner?secret=${MOCK_TOTP_SECRET}&issuer=OffiCraft&algorithm=SHA1&digits=6&period=30`,
+    };
+  },
+
+  async activateMfa(password: string, code: string): Promise<void> {
+    if (mockMfaActive) {
+      throw mockApiError(
+        "http 409 for POST /api/auth/mfa/activate",
+        409,
+        "a second factor is already active"
+      );
+    }
+    if (!mockMfaPending) {
+      throw mockApiError(
+        "http 409 for POST /api/auth/mfa/activate",
+        409,
+        "no pending enrolment; call /api/auth/mfa/enroll first"
+      );
+    }
+    // BOTH factors, ONE indistinguishable refusal — the server's shape. The
+    // pending secret SURVIVES either way: a typo must not force a fresh QR scan.
+    if (
+      password !== mockPassword ||
+      code.replace(/[\s-]/g, "") !== MOCK_TOTP_CODE
+    ) {
+      throw mockApiError(
+        "http 401 for POST /api/auth/mfa/activate",
+        401,
+        "invalid password or code"
+      );
+    }
+    mockMfaPending = false;
+    mockMfaActive = true;
+  },
+
+  async disableMfa(password: string, code: string): Promise<void> {
+    if (!mockMfaActive) {
+      throw mockApiError(
+        "http 409 for POST /api/auth/mfa/disable",
+        409,
+        "no second factor is active"
+      );
+    }
+    // BOTH factors, ONE indistinguishable refusal — the server's shape.
+    if (
+      password !== mockPassword ||
+      code.replace(/[\s-]/g, "") !== MOCK_TOTP_CODE
+    ) {
+      throw mockApiError(
+        "http 401 for POST /api/auth/mfa/disable",
+        401,
+        "invalid password or code"
+      );
+    }
+    mockMfaActive = false;
+    mockMfaPending = false;
   },
 
   async setPassword(password: string, claimToken: string): Promise<void> {
@@ -5685,6 +5770,8 @@ export function __resetMock(): void {
   taskManuals = [];
   mockPasswordSet = true;
   mockPassword = "mock-password";
+  mockMfaActive = false;
+  mockMfaPending = false;
   mockServerSettings = { ...DEFAULT_MOCK_SETTINGS };
   // T-83ef: themes are their own store now, so resetting settings no longer
   // clears them — the reset hook has to name the store explicitly or a theme

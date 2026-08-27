@@ -533,6 +533,8 @@ func cmdServe(env func(string) string, noReconcile, noOutsource bool, out io.Wri
 	api.agentTokenTTL = auth.agentTokenTTL
 	api.passwordHash = auth.passwordHash
 	api.passwordChangedAt = auth.passwordChangedAt
+	api.totpSecret = auth.totpSecret
+	api.totpLastStep = auth.totpLastStep
 	api.ctxhigh = auth.ctxhigh
 	api.codexCompactionThreshold = auth.codexCompactionThreshold
 	api.codexNoticeRound = auth.codexNoticeRound

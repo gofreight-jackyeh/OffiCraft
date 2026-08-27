@@ -42,8 +42,26 @@ const wireSystemSender = "system"
 const wireSchemaVersion = 3
 
 // authStatusDTO is the PUBLIC first-run probe body (GET /api/auth/status).
+//
+// MFARequired is ALWAYS emitted (no omitempty): the schema marks it optional so
+// an older client keeps working, but a server that speaks this field must say
+// `false` out loud rather than leave the login wall to guess from an absence.
 type authStatusDTO struct {
 	PasswordSet bool `json:"password_set"`
+	MFARequired bool `json:"mfa_required"`
+}
+
+// mfaStateDTO is the answer to every /api/auth/mfa/* write.
+//
+// Secret / OtpauthURI are pointers because null and "" are DIFFERENT facts on
+// this wire: null = "there is no pending secret to show you", which is what
+// activate and disable answer. They are populated ONLY by enroll, and only for
+// a pending (unproven) secret — an ACTIVE secret is never echoed back, so a
+// stolen owner token cannot read out an existing enrolment and clone it.
+type mfaStateDTO struct {
+	Enrolled   bool    `json:"enrolled"`
+	Secret     *string `json:"secret"`
+	OtpauthURI *string `json:"otpauth_uri"`
 }
 
 // settingsDTO is the owner-adjustable settings surface (GET/PATCH
