@@ -1,10 +1,11 @@
-# cli/ — Go 自更新 binary(ocagent / ocwarden)
+# cli/ — Go binary(ocagent / ocwarden 自更新;ocbridge)
 
-進入 `cli/` 時 nested-load。repo-wide 憲章 + 約定見 root `CLAUDE.md`;本檔記 cli 專屬。兩個獨立 go module,各自 `go.mod`。棧:go1.26。
+進入 `cli/` 時 nested-load。repo-wide 憲章 + 約定見 root `CLAUDE.md`;本檔記 cli 專屬。各自獨立的 go module,各自 `go.mod`。棧:go1.26。
 
 ## 命名(root §10)
 - **`cli/ocagent/`** — Plane A:agent-side SSE listener(`ocagent listen` = agent 存活心跳;`ocagent context-report` 等)。folder = `module ocagent` = binary `ocagent`。
 - **`cli/ocwarden/`** — Plane B:per-machine warden executor(stateless 執行手,拿 server push 的 token spawn member)。folder = `module ocwarden` = binary `ocwarden`。
+- **`cli/ocbridge/`** — Slack Socket Mode / GitHub review request → OffiCraft chat 的 bridge(以 machine 憑證 `POST /api/chat`)。folder = `module ocbridge` = binary `ocbridge`;子命令 `slack`(常駐)/ `github-watch`(單輪)/ `claim`。取代 Python officraft-slack-bridge,沿用其 config.toml 與 credential.json。**不是自更新 binary**(無 committed prebuilt、不走 bindist);launchd label `com.officraft.ocbridge` / `.github-watch`(範本在 `cli/ocbridge/deploy/`)。context doc:`cli/ocbridge/README.md`(含連線健康警示)。
 - (已拆除)`cli/ocrelease/` 與 `server/ocupdaterd/` 隨 t-dc68 退役:發佈改走 GitHub Releases(`bin/release <tag>` 打包 + `gh release create` 出貨;server 端 update_check.go/upgrade.go 直接對 GitHub API 檢查與升級,見 `server/CLAUDE.md`)。
 - ⚠️ **介面契約(已對齊 ocagent/ocwarden 命名,2026-07-09 owner 定案)**:spawn 寫的 bare **`ocagent` shim 呼叫名**(boot prompt 契約:spawned agent 跑 bare `ocagent listen`)+ launchd **label `com.officraft.ocwarden`**。它們是介面名(非 folder/module/binary),改動需 **host 端協調**(shim 重寫 / warden bootout+relaunch)。
 - **同機多實例 namespace(`OC_NAMESPACE`,2026-07-11 owner 定案)**:單一 env 鍵所有 per-instance host 資源——root `~/.officraft-<ns>`、label `com.officraft.ocwarden.<ns>`、tmux socket `officraft-<ns>`、agent home(ns 非空時 spawn 額外 export `OC_AGENT_HOME`);字元集鎖 `[a-z0-9-]{1,16}`,非法即拒。**空 namespace = 主實例,輸出一個 byte 都不變**(golden 測試釘死)。導出邏輯單點在 `cli/ocwarden/namespace.go`;傳播線:server oc.toml `[server].namespace` → install.sh / bootstrap-here env → warden plist stamp → spawn export。

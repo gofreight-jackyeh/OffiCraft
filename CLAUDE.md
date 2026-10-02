@@ -56,7 +56,7 @@ This file is read by Claude Code agents working in this repo.
 
 top-level:
 - **`server/`** — Go server daemon:`ocserverd/`(**production server**:REST + SSE + MCP + reconcile,goose migrations,SPA go:embed)。folder = module = binary 同名;prebuilt 在 `bin/ocserverd`(勿與 bash installer `bin/ocserver` 混淆)。詳見 `server/CLAUDE.md`。
-- **`cli/`** — Go 自更新 binary:`ocagent/`(Plane A:agent-side SSE listener)· `ocwarden/`(Plane B:per-machine warden executor)。folder = module = binary 同名。詳見 `cli/CLAUDE.md`。
+- **`cli/`** — Go 自更新 binary:`ocagent/`(Plane A:agent-side SSE listener)· `ocwarden/`(Plane B:per-machine warden executor)· `ocbridge/`(Slack/GitHub → chat bridge,非自更新)。folder = module = binary 同名。詳見 `cli/CLAUDE.md`。
 - **`frontend/`** — React18 + Vite5 + TS5 SPA。seam 分層 wire→mappers→types→adapter→mock→http→hooks→component。詳見 `frontend/CLAUDE.md`。
 - **`conformance/`** — 語言無關黑箱套件(HTTP-only,743 tests):wire 行為的回歸權威。詳見 `conformance/CLAUDE.md`。
 - **`e2e_test/`** — Playwright 端到端(隔離 port,**絕不碰 prod**)。詳見 `e2e_test/CLAUDE.md`。
