@@ -1,0 +1,30 @@
+# 複製到 ~/.officraft-slack-bridge/config.toml 並 chmod 600。
+# 這個檔案含兩組憑證,不要進 git。
+
+[slack]
+# App-level token,scope 需要 connections:write。Socket Mode 靠它連線。
+app_token = "xapp-..."
+# Bot token。沒有的話 bridge 仍能運作,但訊息裡只會有 U123/C456 這種 id。
+bot_token = "xoxb-..."
+# 自己的 Slack user id:這些人發的訊息不轉進 officraft
+# (你要的是別人說了什麼,自己說的話不必再回報一次)
+ignore_user_ids = ["U000000"]
+
+[officraft]
+base_url = "http://127.0.0.1:7755"   # 本機直連,不經 tunnel
+# 憑證不放這裡:跑一次 `bridge.py claim <claim-code>`,token 會寫進
+# state_dir/credential.json(0600)並由 bridge 自己續期。
+to       = "mira"                      # 收件成員 id;不可以是 machine
+
+[bridge]
+state_dir = "~/.officraft-slack-bridge"  # seen.db(去重)與 deadletter.jsonl 落點
+
+[github]
+# 個人指名一律查;這裡列的是額外要查的 team
+teams = [
+  "your-org/your-team",
+  "your-org/another-team",
+]
+# 這些作者的 PR 不報 —— renovate 佔你 review 積壓的 71%,且已有 renovate-triage 在處理
+exclude_authors = ["app/renovate", "app/dependabot", "app/github-actions"]
+to = "mira"
