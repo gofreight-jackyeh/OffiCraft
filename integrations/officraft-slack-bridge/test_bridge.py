@@ -169,6 +169,12 @@ check("④ 短暫重連(未達 15 分鐘)不警示、也不發「已恢復」", 
 oc9 = HealthOC(); h = bridge.ConnectionHealth(oc9)
 for t in range(0, 16*60 + 1, 30): h.tick(float(t), False)   # 完全連不上,也沒有 error 回呼
 check("完全連不上(tick 看到斷線)同樣會警示", [s for s,_ in oc9.sent] == ["down"])
+check("tick 看到的斷線不重複計入斷線次數", h.drops == 0)
+
+oc9 = HealthOC(); h = bridge.ConnectionHealth(oc9)
+for t in range(0, 16*60 + 1, 30):   # 每輪 on_error 一次、tick 也看到斷線:同一次斷線只算一次
+    h.mark_down(float(t)); h.tick(float(t), False)
+check("on_error 與 tick 看到同一次斷線只算一次", h.drops == 16*2 + 1)
 
 oc9 = HealthOC(fail=True); h = bridge.ConnectionHealth(oc9)
 flap(h, 0, 15*60 + 30)

@@ -273,7 +273,10 @@ class ConnectionHealth:
     "recovered" line follows — but only if an alert went out, so the routine
     reconnects Slack itself requests every few hours stay silent.
 
-    All methods take `now` so the timing is testable without sleeping.
+    All methods take `now` so the timing is testable without sleeping. In
+    production `now` is time.monotonic(): on macOS it does not advance while
+    the machine sleeps, so waking from a night's sleep is not mistaken for a
+    night-long outage. Wall-clock time is kept only for the message text.
     """
 
     ALERT_AFTER_SECS = 15 * 60
@@ -285,28 +288,32 @@ class ConnectionHealth:
         self.oc = oc
         self.lock = threading.Lock()
         self.down_since: float | None = None
+        self.down_since_wall = 0.0
         self.last_down = 0.0
         self.drops = 0
         self.last_alert: float | None = None
 
-    def mark_down(self, now: float) -> None:
+    def mark_down(self, now: float, count: bool = True) -> None:
+        """`count` is False for a tick that merely finds the socket down, so
+        one drop seen by both on_error and the tick is not counted twice."""
         with self.lock:
             if self.down_since is None:
-                self.down_since = now
+                self.down_since, self.down_since_wall = now, time.time()
                 self.drops = 0
             self.last_down = now
-            self.drops += 1
+            self.drops += count
 
     def tick(self, now: float, connected: bool) -> None:
         """Called from the health thread only. The lock guards state shared
         with slack_sdk's callbacks; delivery (retries can take a minute)
         happens outside it so those callbacks never wait on OffiCraft."""
         if not connected:
-            self.mark_down(now)
+            self.mark_down(now, count=False)
         with self.lock:
             if self.down_since is None:
                 return
             since, last_down, drops = self.down_since, self.last_down, self.drops
+            since_wall = self.down_since_wall
             if connected and now - last_down >= self.STABLE_SECS:
                 alerted = self.last_alert is not None
                 self.down_since, self.last_alert = None, None
@@ -320,7 +327,7 @@ class ConnectionHealth:
         if alerted is None:
             # Marked sent only if delivery worked, so a failed alert is retried
             # on the next tick instead of being lost.
-            if self._send(f"[Slack bridge 警示] Socket Mode 連線自 {_hhmm(since)} 起撐不住"
+            if self._send(f"[Slack bridge 警示] Socket Mode 連線自 {_hhmm(since_wall)} 起撐不住"
                           f"(已 {(now - since) / 60:.0f} 分鐘,斷線 {drops} 次)。"
                           "Slack 訊息目前收不到,且 Slack 不會補送。"
                           "重啟:launchctl kickstart -k gui/$(id -u)/com.jackyeh.officraft-slack-bridge",
@@ -329,7 +336,7 @@ class ConnectionHealth:
                     self.last_alert = now
         elif alerted:
             self._send(f"[Slack bridge 已恢復] Socket Mode 連線已穩定。"
-                       f"斷線約 {(last_down - since) / 60:.0f} 分鐘(自 {_hhmm(since)} 起),"
+                       f"斷線約 {(last_down - since) / 60:.0f} 分鐘(自 {_hhmm(since_wall)} 起),"
                        "這段期間的 Slack 訊息 Slack 不會補送。", "recovered")
 
     def _send(self, body: str, state: str) -> bool:
@@ -342,7 +349,7 @@ class ConnectionHealth:
 
     def run(self, client: SocketModeClient, stop: threading.Event) -> None:
         while not stop.wait(self.TICK_SECS):
-            self.tick(time.time(), client.is_connected())
+            self.tick(time.monotonic(), client.is_connected())
 
 
 def _hhmm(ts: float) -> str:
@@ -475,8 +482,8 @@ def main() -> int:
     threading.Thread(target=cred.keep_fresh, args=(stop,), daemon=True, name="renew").start()
 
     health = ConnectionHealth(oc)
-    client.on_error_listeners.append(lambda _err: health.mark_down(time.time()))
-    client.on_close_listeners.append(lambda *_: health.mark_down(time.time()))
+    client.on_error_listeners.append(lambda _err: health.mark_down(time.monotonic()))
+    client.on_close_listeners.append(lambda *_: health.mark_down(time.monotonic()))
     threading.Thread(target=health.run, args=(client, stop), daemon=True, name="health").start()
 
     LOG.info("connecting to Slack (socket mode); delivering to %s", oc.to)
