@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeOffiCraft serves /api/chat and /api/machines/renew-credential.
@@ -22,6 +24,7 @@ type fakeOffiCraft struct {
 	chatStatus  func(call int) int // status for the n-th /api/chat call (1-based); nil = 200
 	renewStatus int                // 0 = 200
 	renews      int
+	hook        func() // runs at the start of every /api/chat call, outside the lock
 }
 
 type postedChat struct {
@@ -35,6 +38,9 @@ func newFakeOffiCraft(t *testing.T) *fakeOffiCraft {
 	f := &fakeOffiCraft{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if f.hook != nil {
+			f.hook()
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.chatCalls++
@@ -182,5 +188,42 @@ func TestRenewWritesCredentialAtomically0600(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(filepath.Dir(c.path)); len(entries) != 1 {
 		t.Fatalf("temp file left behind: %v", entries)
+	}
+}
+
+// A laptop asleep most of the time: the monotonic clock barely moves while the
+// wall clock jumps past the 2/3 point. The next wake-up must renew, and no
+// single wait may exceed an hour.
+func TestKeepFreshRenewsAfterWallClockJump(t *testing.T) {
+	f := newFakeOffiCraft(t)
+	c := testCred(t, f.srv.URL)
+	wall := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	c.wall = func() time.Time { return wall }
+	c.mu.Lock()
+	c.expiresAt = float64(wall.Add(30 * 24 * time.Hour).Unix()) // renew point: 10 days out
+	c.mu.Unlock()
+	var waits []time.Duration
+	c.sleep = func(_ context.Context, d time.Duration) bool {
+		waits = append(waits, d)
+		if len(waits) == 1 {
+			wall = wall.Add(21 * 24 * time.Hour) // slept through the renewal point
+			return true
+		}
+		return false // stop after the renewal
+	}
+	c.keepFresh(context.Background())
+	if _, _, renews := f.snapshot(); renews != 1 {
+		t.Fatalf("renews = %d, want 1 right after waking past the 2/3 point", renews)
+	}
+	for _, d := range waits {
+		if d > time.Hour {
+			t.Fatalf("a single wait of %s exceeds the 1 h cap", d)
+		}
+	}
+	if len(waits) != 2 {
+		t.Fatalf("waits = %v, want one before and one after the renewal", waits)
+	}
+	if got := c.expiry() - float64(wall.Unix()); got < 29*86400 {
+		t.Fatalf("renewed expiry must be computed from the wall clock, %f s left", got)
 	}
 }

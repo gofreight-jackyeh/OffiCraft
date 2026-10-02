@@ -111,8 +111,11 @@ github-watch 的 plist PATH 要找得到 `gh`(Apple silicon 的 Homebrew 在 `/o
 - **重新開始**:去重表改成 `seen.json` / `github_seen.json`,舊的 `seen.db` /
   `github_seen.db` / `github_seeded` 不讀。Slack 端影響只有切換那一刻若剛好重送會多一則;
   github-watch 因為 `github_seen.json` 不存在,第一輪**只 seed、不回報**,不會把整個積壓再報一次。
-- **launchd label 換了**:舊 job 先 `bootout`、再裝 `deploy/` 的新範本,不要兩個同時跑
-  (同一個 Slack app 兩條 Socket Mode 連線會讓事件隨機分到其中一條)。
+- **launchd label 換了**:舊 job 先 `launchctl bootout gui/$(id -u)/<舊 label>`,**再把舊 Python
+  bridge 的 plist(你當初安裝它用的那個 label)從 `~/Library/LaunchAgents/` 刪掉**,最後才裝
+  `deploy/` 的新範本。只 bootout 不刪檔,下次登入舊 job 會被重新載入,變成兩條 Socket Mode 連線
+  同時跑,同一個 Slack app 的事件會被隨機分到其中一條 —— 新 bridge 只收到一部分。
+  github-watch 的舊 plist 同理。
 
 ## 運作上要知道的事
 
@@ -123,8 +126,14 @@ github-watch 的 plist PATH 要找得到 `gh`(Apple silicon 的 Homebrew 在 `/o
   慢 ack 會被 Slack 重送。
 * **重連永不放棄**。讀取錯誤、連線被關、`apps.connections.open` 或 dial 失敗(包含啟動時
   的第一次)都走同一個重連迴圈:5 秒起跳、每次加倍、上限 60 秒;收到 `hello` 就重設。
-  Slack 送 `disconnect`(例行換線)則立即重連。另外每 30 秒送一次 ping,90 秒沒收到任何
-  bytes(含 pong)就判定半開連線、主動斷掉重連。
+  Slack 送 `disconnect` 時,只有「已收到 hello」且 reason 是 `refresh_requested` / `warning`
+  (例行換線)才立即重連;`link_disabled` 或還沒 hello 就被斷,一律走 backoff,
+  不狂打 `apps.connections.open`。另外每 30 秒送一次 ping,90 秒沒收到任何 bytes(含 pong)
+  就判定半開連線、直接關掉底層 socket 重連(不走 websocket close,避免卡在寫入鎖上);
+  每次寫入也有 30 秒上限。
+* **關機不丟訊息**。SIGTERM(包括警示訊息裡的 `kickstart -k`)時,已 ack、還在投遞中的訊息
+  最多等 10 秒;等不到的寫進 `deadletter.jsonl`(極少數情況下會同時出現在聊天與 deadletter,
+  寧可重複不可遺失)。
 * **去重靠我們自己**。OffiCraft 的聊天入口沒有去重,而 Slack 會重送沒 ack 的 envelope。
   `seen.json` 擋掉重送,且**跨重啟有效**(重啟後立刻重連正是最容易重送的時刻);
   超過 7 天的鍵會被清掉(github 180 天)。檔案損毀時 slack 模式記 ERROR 並以空表啟動。
@@ -151,9 +160,11 @@ BrokenPipe、約 6 秒重連一次),log 看起來很忙,但什麼都進不來。
   `launchctl kickstart -k gui/$(id -u)/com.officraft.ocbridge`。
 * 仍未恢復時**每小時最多再提醒一則**;穩定後發一則 `[Slack bridge 已恢復]` — 只在先前
   真的發過警示時才發,所以 Slack 自己要求的例行重連(幾秒就好)不會發任何訊息。
-* 警示送不出去(例如 OffiCraft 本身掛了)不算已送,記 ERROR log、下一次檢查再試;
+* 警示與「已恢復」送不出去(例如 OffiCraft 本身掛了)都不算已送,記 ERROR log、下一次檢查
+  再試;若在補送「已恢復」之前又開始新的斷線,就取消那則,改由新斷線自己的警示說話;
   發送時不持有鎖,不會卡住 socket 讀取。
 * 時間以 monotonic clock 計:macOS 睡眠期間不前進,睡一晚醒來不會被當成一整晚的斷線。
+  (反過來,憑證續期以 wall clock 為準、每次最多等 1 小時,常睡眠的筆電也不會拖過到期日。)
 * process 整個掛掉由 launchd `KeepAlive` 處理,不在這裡。
 
 ## 誰的訊息會被轉進去

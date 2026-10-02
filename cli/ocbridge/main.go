@@ -164,7 +164,12 @@ func runSlack(ctx context.Context, cfg *Config, stateDir string, cred *Credentia
 	go cred.keepFresh(ctx)
 	log.Printf("connecting to Slack (socket mode); delivering to %s", oc.to)
 	newSocketClient(cfg.Slack.AppToken, b, health).run(ctx)
+	// SIGTERM (including the alert's own `kickstart -k` hint) must not drop
+	// messages that were acked but not yet delivered.
+	b.drain(shutdownGrace)
 }
+
+const shutdownGrace = 10 * time.Second
 
 func main() {
 	log.SetFlags(log.LstdFlags)

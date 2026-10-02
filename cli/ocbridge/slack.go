@@ -202,6 +202,61 @@ type bridge struct {
 	names      *nameCache
 	deadletter string
 	ignore     map[string]bool
+
+	// In-flight deliveries. Their envelopes are already acked, so on shutdown
+	// they must finish or land in deadletter — Slack will not send them again.
+	inflight sync.WaitGroup
+	mu       sync.Mutex
+	pending  map[int]json.RawMessage
+	nextID   int
+}
+
+// track wraps one events_api handler so drain can wait for it.
+func (b *bridge) track(payload json.RawMessage, f func()) func() {
+	b.mu.Lock()
+	if b.pending == nil {
+		b.pending = map[int]json.RawMessage{}
+	}
+	id := b.nextID
+	b.nextID++
+	b.pending[id] = payload
+	b.mu.Unlock()
+	b.inflight.Add(1)
+	return func() {
+		defer b.inflight.Done()
+		defer func() {
+			b.mu.Lock()
+			delete(b.pending, id)
+			b.mu.Unlock()
+		}()
+		f()
+	}
+}
+
+// drain waits up to timeout for in-flight deliveries, then writes whatever is
+// still unfinished to deadletter. A delivery that completes right after the
+// deadline may then exist both in chat and in deadletter — a duplicate is
+// preferred over a silent loss.
+func (b *bridge) drain(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() { b.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+	}
+	b.mu.Lock()
+	left := make([]json.RawMessage, 0, len(b.pending))
+	for _, p := range b.pending {
+		left = append(left, p)
+	}
+	b.mu.Unlock()
+	for _, p := range left {
+		log.Printf("ERROR shutdown with delivery still in flight — writing to deadletter")
+		if err := appendDeadletter(b.deadletter, errors.New("shutdown before delivery finished"), p); err != nil {
+			log.Printf("ERROR deadletter write failed, message LOST: %v (payload %s)", err, snippet(p))
+		}
+	}
 }
 
 // handleEvent processes one events_api payload. It runs after the ack.
@@ -307,22 +362,23 @@ func appendDeadletter(path string, cause error, payload json.RawMessage) error {
 type envelope struct {
 	EnvelopeID string          `json:"envelope_id"`
 	Type       string          `json:"type"`
+	Reason     string          `json:"reason"` // disconnect: refresh_requested | warning | link_disabled
 	Payload    json.RawMessage `json:"payload"`
 }
 
 // onFrame acks the envelope FIRST — a slow ack is re-delivered, and a
 // re-delivery we then also process is a duplicate — then hands events_api
 // work to run (a goroutine in production, inline in tests). It returns the
-// envelope type so the connection loop can react to hello / disconnect.
-func (b *bridge) onFrame(raw []byte, ack func(envelopeID string) error, run func(func())) (string, error) {
+// envelope so the connection loop can react to hello / disconnect.
+func (b *bridge) onFrame(raw []byte, ack func(envelopeID string) error, run func(func())) (envelope, error) {
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		log.Printf("WARNING unreadable socket frame: %v", err)
-		return "", nil
+		return env, nil
 	}
 	if env.EnvelopeID != "" {
 		if err := ack(env.EnvelopeID); err != nil {
-			return env.Type, fmt.Errorf("ack %s: %w", env.EnvelopeID, err)
+			return env, fmt.Errorf("ack %s: %w", env.EnvelopeID, err)
 		}
 	}
 	switch env.Type {
@@ -332,9 +388,9 @@ func (b *bridge) onFrame(raw []byte, ack func(envelopeID string) error, run func
 		log.Printf("socket mode: disconnect requested by Slack (%s)", snippet(raw))
 	case "events_api":
 		payload := env.Payload
-		run(func() { b.handleEvent(payload) })
+		run(b.track(payload, func() { b.handleEvent(payload) }))
 	}
-	return env.Type, nil
+	return env, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +481,10 @@ func (s *socketClient) session(ctx context.Context) (reconnectNow, gotHello bool
 	defer s.connected.Store(false)
 	done := make(chan struct{})
 	defer close(done)
+	// Every close below is of the RAW socket, never ws.Close(): ws.Close()
+	// takes the websocket write lock to send a close frame, and a writer stuck
+	// on a full send buffer holds that lock — the close would block, the reader
+	// would never return, and health would keep seeing "connected".
 	go func() { // close on shutdown, and on a half-open socket (no bytes, not even pongs)
 		t := time.NewTicker(s.pingEvery)
 		defer t.Stop()
@@ -433,19 +493,19 @@ func (s *socketClient) session(ctx context.Context) (reconnectNow, gotHello bool
 			case <-done:
 				return
 			case <-ctx.Done():
-				ws.Close()
+				conn.Close()
 				return
 			case <-t.C:
 				if conn.idle() > s.readTimeout {
 					log.Printf("WARNING socket silent for %s — dropping it", conn.idle().Round(time.Second))
-					ws.Close()
+					conn.Close()
 					return
 				}
 				_ = pingCodec.Send(ws, nil)
 			}
 		}
 	}()
-	defer ws.Close()
+	defer conn.Close()
 
 	ack := func(id string) error { return websocket.JSON.Send(ws, map[string]string{"envelope_id": id}) }
 	run := func(f func()) { go f() }
@@ -454,15 +514,21 @@ func (s *socketClient) session(ctx context.Context) (reconnectNow, gotHello bool
 		if err := websocket.Message.Receive(ws, &frame); err != nil {
 			return false, gotHello, fmt.Errorf("read: %w", err)
 		}
-		typ, err := s.bridge.onFrame(frame, ack, run)
+		env, err := s.bridge.onFrame(frame, ack, run)
 		if err != nil {
 			return false, gotHello, err
 		}
-		switch typ {
+		switch env.Type {
 		case "hello":
 			gotHello = true
 		case "disconnect":
-			return true, gotHello, nil
+			// Skip the backoff only for Slack's routine connection rotation on
+			// a connection that actually worked. link_disabled, or a disconnect
+			// before hello, would otherwise hammer apps.connections.open.
+			if gotHello && (env.Reason == "refresh_requested" || env.Reason == "warning") {
+				return true, gotHello, nil
+			}
+			return false, gotHello, fmt.Errorf("disconnect (reason %q, hello %v)", env.Reason, gotHello)
 		}
 	}
 }
@@ -492,19 +558,30 @@ var pingCodec = websocket.Codec{Marshal: func(any) ([]byte, byte, error) {
 // frames, so the raw socket is the only place a pong is observable.
 type trackedConn struct {
 	net.Conn
-	last atomic.Int64 // UnixNano of the last successful read
+	last atomic.Pointer[time.Time] // last successful read; keeps the monotonic reading
 }
 
 func (c *trackedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.last.Store(time.Now().UnixNano())
+		now := time.Now()
+		c.last.Store(&now)
 	}
 	return n, err
 }
 
+// Write bounds every write, so a peer that stops reading surfaces as a write
+// error instead of a goroutine stuck forever holding the websocket write lock.
+// Writes are serialized by that lock, so setting the deadline here is race-free.
+func (c *trackedConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.Conn.Write(p)
+}
+
+const writeTimeout = 30 * time.Second
+
 func (c *trackedConn) idle() time.Duration {
-	return time.Since(time.Unix(0, c.last.Load()))
+	return time.Since(*c.last.Load())
 }
 
 func dialWebsocket(ctx context.Context, raw string) (*websocket.Conn, *trackedConn, error) {
@@ -538,13 +615,14 @@ func dialWebsocket(ctx context.Context, raw string) (*websocket.Conn, *trackedCo
 		return nil, nil, err
 	}
 	tc := &trackedConn{Conn: nc}
-	tc.last.Store(time.Now().UnixNano())
-	_ = nc.SetDeadline(time.Now().Add(30 * time.Second)) // bound the handshake
+	start := time.Now()
+	tc.last.Store(&start)
+	_ = nc.SetReadDeadline(start.Add(30 * time.Second)) // bound the handshake (writes are bounded per call)
 	ws, err := websocket.NewClient(cfg, tc)
 	if err != nil {
 		nc.Close()
 		return nil, nil, err
 	}
-	_ = nc.SetDeadline(time.Time{})
+	_ = nc.SetReadDeadline(time.Time{})
 	return ws, tc, nil
 }

@@ -47,6 +47,11 @@ type connectionHealth struct {
 	drops     int
 	alerted   bool // an alert (or reminder) went out for the current outage
 	lastAlert time.Time
+
+	// A "recovered" line owed for the last outage, retried each tick until it
+	// is delivered; a new outage cancels it (its alert will speak instead).
+	recoverPending          bool
+	recoverSince, recoverTo time.Time
 }
 
 // markDown records a drop. count is false for a tick that merely finds the
@@ -57,6 +62,7 @@ func (h *connectionHealth) markDown(now time.Time, count bool) {
 	defer h.mu.Unlock()
 	if !h.down {
 		h.down, h.downSince, h.drops = true, now, 0
+		h.recoverPending = false
 	}
 	h.lastDown = now
 	if count {
@@ -72,38 +78,42 @@ func (h *connectionHealth) tick(now time.Time, connected bool) {
 		h.markDown(now, false)
 	}
 	h.mu.Lock()
-	if !h.down {
-		h.mu.Unlock()
-		return
+	if h.down {
+		since, lastDown, drops := h.downSince, h.lastDown, h.drops
+		switch {
+		case connected && now.Sub(lastDown) >= stableFor:
+			if h.alerted {
+				h.recoverPending, h.recoverSince, h.recoverTo = true, since, lastDown
+			}
+			h.down, h.alerted = false, false
+		case now.Sub(since) < alertAfter || (h.alerted && now.Sub(h.lastAlert) < remindEvery):
+			h.mu.Unlock()
+			return
+		default:
+			h.mu.Unlock()
+			body := fmt.Sprintf("[Slack bridge 警示] Socket Mode 連線自 %s 起撐不住(已 %s 分鐘,斷線 %d 次)。"+
+				"Slack 訊息目前收不到,且 Slack 不會補送。重啟:%s",
+				stamp(since), minutes(now.Sub(since)), drops, restartHint)
+			// Marked sent only if delivery worked, so a failed alert is
+			// retried on the next tick instead of being lost.
+			if h.deliver(body, "down") {
+				h.mu.Lock()
+				h.alerted, h.lastAlert = true, now
+				h.mu.Unlock()
+			}
+			return
+		}
 	}
-	since, lastDown, drops := h.downSince, h.lastDown, h.drops
-	var due, recovered bool
-	switch {
-	case connected && now.Sub(lastDown) >= stableFor:
-		recovered = h.alerted
-		h.down, h.alerted = false, false
-	case now.Sub(since) < alertAfter || (h.alerted && now.Sub(h.lastAlert) < remindEvery):
-		h.mu.Unlock()
-		return
-	default:
-		due = true
-	}
+	pending, since, until := h.recoverPending, h.recoverSince, h.recoverTo
 	h.mu.Unlock()
 
-	if due {
-		body := fmt.Sprintf("[Slack bridge 警示] Socket Mode 連線自 %s 起撐不住(已 %s 分鐘,斷線 %d 次)。"+
-			"Slack 訊息目前收不到,且 Slack 不會補送。重啟:%s",
-			stamp(since), minutes(now.Sub(since)), drops, restartHint)
-		// Marked sent only if delivery worked, so a failed alert is retried on
-		// the next tick instead of being lost.
-		if h.deliver(body, "down") {
-			h.mu.Lock()
-			h.alerted, h.lastAlert = true, now
-			h.mu.Unlock()
+	if pending && h.deliver(fmt.Sprintf("[Slack bridge 已恢復] Socket Mode 連線已穩定。斷線約 %s 分鐘(自 %s 起),"+
+		"這段期間的 Slack 訊息 Slack 不會補送。", minutes(until.Sub(since)), stamp(since)), "recovered") {
+		h.mu.Lock()
+		if h.recoverSince.Equal(since) { // not superseded meanwhile
+			h.recoverPending = false
 		}
-	} else if recovered {
-		h.deliver(fmt.Sprintf("[Slack bridge 已恢復] Socket Mode 連線已穩定。斷線約 %s 分鐘(自 %s 起),"+
-			"這段期間的 Slack 訊息 Slack 不會補送。", minutes(lastDown.Sub(since)), stamp(since)), "recovered")
+		h.mu.Unlock()
 	}
 }
 

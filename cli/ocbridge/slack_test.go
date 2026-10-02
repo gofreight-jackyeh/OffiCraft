@@ -267,3 +267,41 @@ func TestHelpExitsZero(t *testing.T) {
 		}
 	}
 }
+
+func TestShutdownWaitsForInFlightDelivery(t *testing.T) {
+	f := newFakeOffiCraft(t)
+	f.hook = func() { time.Sleep(200 * time.Millisecond) }
+	b := testBridge(t, testPoster(t, f))
+	if _, err := b.onFrame(frame(t, "env-1", "Ev1", "U0EXAMPLE", true), func(string) error { return nil }, func(fn func()) { go fn() }); err != nil {
+		t.Fatal(err)
+	}
+	b.drain(5 * time.Second)
+	if posts, _, _ := f.snapshot(); len(posts) != 1 {
+		t.Fatalf("drain must wait for the in-flight delivery, got %d posts", len(posts))
+	}
+	if _, err := os.Stat(b.deadletter); err == nil {
+		t.Fatal("a delivery finished within the grace must not be dead-lettered")
+	}
+}
+
+func TestShutdownDeadlineWritesDeadletter(t *testing.T) {
+	f := newFakeOffiCraft(t)
+	release := make(chan struct{})
+	f.hook = func() { <-release }
+	t.Cleanup(func() { close(release) }) // before the fake server closes (LIFO)
+	b := testBridge(t, testPoster(t, f))
+	if _, err := b.onFrame(frame(t, "env-1", "Ev1", "U0EXAMPLE", true), func(string) error { return nil }, func(fn func()) { go fn() }); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the delivery to be in flight", func() bool {
+		_, calls, _ := f.snapshot()
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return calls == 0 && len(b.pending) == 1
+	})
+	b.drain(100 * time.Millisecond)
+	data, err := os.ReadFile(b.deadletter)
+	if err != nil || !strings.Contains(string(data), "shutdown before delivery finished") || !strings.Contains(string(data), "same message") {
+		t.Fatalf("unfinished delivery must land in deadletter: %s (%v)", data, err)
+	}
+}

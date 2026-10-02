@@ -31,6 +31,10 @@ type Credential struct {
 	base   string
 	path   string
 	client *http.Client
+	// wall and sleep are seams for keepFresh tests; production uses the
+	// wall clock and a ctx-aware timer.
+	wall  func() time.Time
+	sleep func(ctx context.Context, d time.Duration) bool
 
 	mu        sync.Mutex
 	token     string
@@ -48,6 +52,8 @@ func newCredential(baseURL, path string) (*Credential, error) {
 		base:   strings.TrimRight(baseURL, "/"),
 		path:   path,
 		client: &http.Client{Timeout: 15 * time.Second},
+		wall:   time.Now,
+		sleep:  sleepCtx,
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -70,10 +76,28 @@ func (c *Credential) Token() string {
 	return c.token
 }
 
-func (c *Credential) remaining() time.Duration {
+// expiry returns the wall-clock expiry as recorded in credential.json.
+func (c *Credential) expiry() float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return time.Duration((c.expiresAt - unixNow()) * float64(time.Second))
+	return c.expiresAt
+}
+
+func (c *Credential) wallUnix() float64 { return float64(c.wall().UnixNano()) / 1e9 }
+
+func (c *Credential) remaining() time.Duration {
+	return time.Duration((c.expiry() - c.wallUnix()) * float64(time.Second))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func unixNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
@@ -120,7 +144,7 @@ func (c *Credential) call(path string, body any, token string) (mintResponse, er
 
 // save must be called with c.mu held.
 func (c *Credential) save(r mintResponse) error {
-	expires := unixNow() + float64(r.ExpiresIn)
+	expires := c.wallUnix() + float64(r.ExpiresIn)
 	data, _ := json.MarshalIndent(credentialFile{r.Token, expires, r.MachineID}, "", "  ")
 	// Atomic: a torn credential file bricks the bridge.
 	if err := writeFileAtomic(c.path, data, 0o600); err != nil {
@@ -155,23 +179,52 @@ func (c *Credential) Renew() error {
 // keepFresh renews at 2/3 of remaining life and retries hourly on failure.
 // Failure is not fatal while the current token still works, so it logs and
 // retries rather than taking the bridge down — but once the token does expire
-// every delivery 401s, which is why the warning is loud.
+// every delivery 401s (health alerts included), which is why the warning is
+// loud.
+//
+// The renewal point is a WALL-clock time, and no single wait exceeds
+// keepFreshMaxWait: Go timers run on the monotonic clock, which on macOS does
+// not advance while the machine sleeps, so one long timer on a laptop that
+// sleeps a lot would fire days late — possibly after expiry. Waking at least
+// hourly and comparing against the wall clock bounds that lateness to an hour
+// of awake time.
 func (c *Credential) keepFresh(ctx context.Context) {
+	next, basis := c.renewPoint()
 	for {
-		wait := time.Hour
-		if rem := c.remaining(); rem > 0 {
-			wait = max(time.Minute, rem/3)
+		for now := c.wall(); now.Before(next); now = c.wall() {
+			if c.expiry() != basis { // renewed elsewhere (a 401 retry): re-plan
+				break
+			}
+			if !c.sleep(ctx, min(keepFreshMaxWait, next.Sub(now))) {
+				return
+			}
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(wait):
+		if c.expiry() != basis {
+			next, basis = c.renewPoint()
+			continue
 		}
 		if err := c.Renew(); err != nil {
 			log.Printf("WARNING credential renewal failed (%.1f days left): %v",
 				max(0, c.remaining().Hours()/24), err)
+			next = c.wall().Add(time.Hour)
+			continue
 		}
+		next, basis = c.renewPoint()
 	}
+}
+
+const keepFreshMaxWait = time.Hour
+
+// renewPoint is the wall-clock time to renew at (1/3 of the remaining life
+// from now, at least a minute; now if already expired) and the expiry it was
+// computed from.
+func (c *Credential) renewPoint() (time.Time, float64) {
+	exp, now := c.expiry(), c.wall()
+	rem := time.Duration((exp - float64(now.UnixNano())/1e9) * float64(time.Second))
+	if rem <= 0 {
+		return now, exp
+	}
+	return now.Add(max(time.Minute, rem/3)), exp
 }
 
 // ---------------------------------------------------------------------------

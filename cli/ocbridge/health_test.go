@@ -148,3 +148,31 @@ func TestHealthDropsNotDoubleCounted(t *testing.T) {
 		t.Fatalf("drops = %d, want %d (one per real drop)", got, want)
 	}
 }
+
+func TestHealthFailedRecoveredRetriedNextTick(t *testing.T) {
+	h, r := newHealth()
+	flap(h, 0, 20*60)
+	r.fail = true
+	steady(h, 20*60, 5*60)
+	if !reflect.DeepEqual(r.states, []string{"down"}) {
+		t.Fatalf("recovered must not be recorded while delivery fails, got %v", r.states)
+	}
+	r.fail = false
+	steady(h, 25*60, 30*60)
+	if !reflect.DeepEqual(r.states, []string{"down", "recovered"}) {
+		t.Fatalf("want recovered re-sent exactly once, got %v", r.states)
+	}
+}
+
+func TestHealthNewOutageCancelsPendingRecovered(t *testing.T) {
+	h, r := newHealth()
+	flap(h, 0, 20*60)
+	r.fail = true
+	steady(h, 20*60, 5*60) // recovered owed but undelivered
+	h.markDown(at(25*60), true)
+	r.fail = false
+	steady(h, 25*60+30, 5*60) // short new outage that heals without an alert
+	if !reflect.DeepEqual(r.states, []string{"down"}) {
+		t.Fatalf("a new outage must cancel the pending recovered, got %v", r.states)
+	}
+}
