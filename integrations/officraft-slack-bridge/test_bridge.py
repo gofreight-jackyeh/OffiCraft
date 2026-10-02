@@ -119,5 +119,50 @@ with _tf.TemporaryDirectory() as d:
     check("兩種授權看到同一則訊息只投遞一次", len(sent2) == 1)
     check("兩者都有 ack", c2.acks == 2)
 
+# 9) 連線健康:連上即斷要在 15 分鐘內警示、恢復要說、同一次斷線一小時內不重複、正常時安靜
+class HealthOC:
+    def __init__(self, fail=False): self.sent=[]; self.fail=fail
+    def post(self, body, meta):
+        if self.fail: raise RuntimeError("officraft down")
+        self.sent.append((meta["state"], body))
+
+def flap(h, start, secs):
+    """模擬 2026-09 的故障形狀:每 6 秒斷一次,每 30 秒 tick 一次(tick 當下剛好連著)。"""
+    for t in range(start, start + secs):
+        if t % 6 == 0: h.mark_down(float(t))
+        if t % 30 == 0: h.tick(float(t), True)
+
+def steady(h, start, secs):
+    for t in range(start, start + secs, 30): h.tick(float(t), True)
+
+oc9 = HealthOC(); h = bridge.ConnectionHealth(oc9)
+flap(h, 0, 15*60 + 30)
+check("① 連上即斷:15 分鐘內發出一則警示", [s for s,_ in oc9.sent] == ["down"])
+check("警示寫明斷線起點與次數", "斷線" in oc9.sent[0][1] and "次" in oc9.sent[0][1])
+flap(h, 15*60 + 30, 45*60)   # 一直到 60 分鐘仍在斷
+check("③ 同一次斷線一小時內不重複", len(oc9.sent) == 1)
+flap(h, 60*60 + 30, 16*60)   # 第一則警示滿一小時後
+check("③ 仍未恢復時,滿一小時才再提醒一次", [s for s,_ in oc9.sent] == ["down", "down"])
+steady(h, 76*60 + 30, 5*60)
+check("② 恢復後發一則「已恢復」", [s for s,_ in oc9.sent] == ["down", "down", "recovered"])
+steady(h, 81*60 + 30, 60*60)
+check("恢復後持續正常不再發任何訊息", len(oc9.sent) == 3)
+
+oc9 = HealthOC(); h = bridge.ConnectionHealth(oc9)
+steady(h, 0, 24*3600)
+check("④ 正常運作一整天不發任何訊息", oc9.sent == [])
+h.mark_down(100000.0); steady(h, 100020, 10*60)   # Slack 自己要求的例行重連:斷一下就好
+check("④ 短暫重連(未達 15 分鐘)不警示、也不發「已恢復」", oc9.sent == [])
+
+oc9 = HealthOC(); h = bridge.ConnectionHealth(oc9)
+for t in range(0, 16*60 + 1, 30): h.tick(float(t), False)   # 完全連不上,也沒有 error 回呼
+check("完全連不上(tick 看到斷線)同樣會警示", [s for s,_ in oc9.sent] == ["down"])
+
+oc9 = HealthOC(fail=True); h = bridge.ConnectionHealth(oc9)
+flap(h, 0, 15*60 + 30)
+check("警示投遞失敗不會被記成已送", h.last_alert is None)
+oc9.fail = False; flap(h, 15*60 + 30, 60)
+check("投遞恢復後下一次 tick 補送警示", [s for s,_ in oc9.sent] == ["down"])
+
 print("\n" + ("全部通過" if not fails else f"失敗 {len(fails)} 項: {fails}"))
 sys.exit(1 if fails else 0)

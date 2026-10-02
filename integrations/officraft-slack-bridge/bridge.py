@@ -258,6 +258,97 @@ class OffiCraft:
         raise RuntimeError(f"delivery failed after {DELIVER_RETRIES} attempts: {last}")
 
 
+class ConnectionHealth:
+    """Says so in chat when the Slack socket stops holding — and when it is back.
+
+    The failure this exists for is not a dead process (launchd KeepAlive
+    restarts that) but a live one stuck in a reconnect loop: every ~6 s the
+    socket connects, hits BrokenPipe, and slack_sdk reconnects. The process is
+    up, logs look busy, and nothing reaches OffiCraft. That ran 11 days unseen.
+
+    So "healthy" means the socket STAYED up: no error/close for STABLE_SECS
+    while connected. Any error/close (or a tick that finds it disconnected)
+    opens an outage; an outage older than ALERT_AFTER_SECS posts one alert,
+    then at most one reminder per REMIND_EVERY_SECS; once stable again, a
+    "recovered" line follows — but only if an alert went out, so the routine
+    reconnects Slack itself requests every few hours stay silent.
+
+    All methods take `now` so the timing is testable without sleeping.
+    """
+
+    ALERT_AFTER_SECS = 15 * 60
+    REMIND_EVERY_SECS = 60 * 60
+    STABLE_SECS = 2 * 60
+    TICK_SECS = 30
+
+    def __init__(self, oc: OffiCraft) -> None:
+        self.oc = oc
+        self.lock = threading.Lock()
+        self.down_since: float | None = None
+        self.last_down = 0.0
+        self.drops = 0
+        self.last_alert: float | None = None
+
+    def mark_down(self, now: float) -> None:
+        with self.lock:
+            if self.down_since is None:
+                self.down_since = now
+                self.drops = 0
+            self.last_down = now
+            self.drops += 1
+
+    def tick(self, now: float, connected: bool) -> None:
+        """Called from the health thread only. The lock guards state shared
+        with slack_sdk's callbacks; delivery (retries can take a minute)
+        happens outside it so those callbacks never wait on OffiCraft."""
+        if not connected:
+            self.mark_down(now)
+        with self.lock:
+            if self.down_since is None:
+                return
+            since, last_down, drops = self.down_since, self.last_down, self.drops
+            if connected and now - last_down >= self.STABLE_SECS:
+                alerted = self.last_alert is not None
+                self.down_since, self.last_alert = None, None
+            elif now - since < self.ALERT_AFTER_SECS or (
+                self.last_alert is not None and now - self.last_alert < self.REMIND_EVERY_SECS
+            ):
+                return
+            else:
+                alerted = None  # an alert is due
+
+        if alerted is None:
+            # Marked sent only if delivery worked, so a failed alert is retried
+            # on the next tick instead of being lost.
+            if self._send(f"[Slack bridge 警示] Socket Mode 連線自 {_hhmm(since)} 起撐不住"
+                          f"(已 {(now - since) / 60:.0f} 分鐘,斷線 {drops} 次)。"
+                          "Slack 訊息目前收不到,且 Slack 不會補送。"
+                          "重啟:launchctl kickstart -k gui/$(id -u)/com.jackyeh.officraft-slack-bridge",
+                          "down"):
+                with self.lock:
+                    self.last_alert = now
+        elif alerted:
+            self._send(f"[Slack bridge 已恢復] Socket Mode 連線已穩定。"
+                       f"斷線約 {(last_down - since) / 60:.0f} 分鐘(自 {_hhmm(since)} 起),"
+                       "這段期間的 Slack 訊息 Slack 不會補送。", "recovered")
+
+    def _send(self, body: str, state: str) -> bool:
+        try:
+            self.oc.post(body, {"source": "slack-bridge-health", "state": state})
+            return True
+        except Exception as exc:  # noqa: BLE001 - the monitor must outlive a failed alert
+            LOG.error("health alert (%s) not delivered: %s", state, exc)
+            return False
+
+    def run(self, client: SocketModeClient, stop: threading.Event) -> None:
+        while not stop.wait(self.TICK_SECS):
+            self.tick(time.time(), client.is_connected())
+
+
+def _hhmm(ts: float) -> str:
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
 def render(event: dict[str, Any], names: NameCache) -> str:
     """One human-readable line, then the text.
 
@@ -382,6 +473,11 @@ def main() -> int:
         signal.signal(sig, lambda *_: stop.set())
 
     threading.Thread(target=cred.keep_fresh, args=(stop,), daemon=True, name="renew").start()
+
+    health = ConnectionHealth(oc)
+    client.on_error_listeners.append(lambda _err: health.mark_down(time.time()))
+    client.on_close_listeners.append(lambda *_: health.mark_down(time.time()))
+    threading.Thread(target=health.run, args=(client, stop), daemon=True, name="health").start()
 
     LOG.info("connecting to Slack (socket mode); delivering to %s", oc.to)
     client.connect()

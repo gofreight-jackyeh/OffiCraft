@@ -76,6 +76,13 @@ tail -f ~/.officraft-slack-bridge/bridge.out.log
   `deadletter.jsonl`,不會無聲消失。
 * **401 會自動續期一次再重試**,避免 token 到期後每則訊息都進 deadletter。
 * 忽略 bot 自己發的訊息與 `message_changed` / `channel_join` 這類雜訊,避免迴圈與噪音。
+* **連線撐不住會在聊天裡說**。process 活著、卻卡在「連上即斷、每幾秒重連」時(2026-09 曾這樣
+  靜默 11 天),log 看起來很忙,但什麼都進不來。`ConnectionHealth` 以「連上後撐滿 2 分鐘沒有
+  error/close」當作健康:斷線持續 15 分鐘 → 發一則 `[Slack bridge 警示]` 給 `[officraft].to`;
+  仍未恢復時每小時最多再提醒一則;穩定後發一則 `[Slack bridge 已恢復]`。Slack 自己要求的例行
+  重連不到 15 分鐘就好,不會發任何訊息。警示走的是同一條 `POST /api/chat`,所以 OffiCraft
+  本身掛了時警示也送不出去(會記 ERROR log,下一次檢查再試)。process 整個掛掉由 launchd
+  `KeepAlive` 處理,不在這裡。
 
 ## 誰的訊息會被轉進去
 
@@ -106,5 +113,5 @@ bot 只看得到**自己在場**的對話:被 `/invite` 邀進去的頻道、以
 ## 測試
 
 ```bash
-uv run python test_bridge.py    # 19 項:去重(含跨授權)、渲染、重試策略、401 續期、自我訊息過濾
+uv run python test_bridge.py    # 30 項:去重(含跨授權)、渲染、重試策略、401 續期、自我訊息過濾、連線健康警示
 ```
