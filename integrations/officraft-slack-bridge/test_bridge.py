@@ -119,6 +119,18 @@ with _tf.TemporaryDirectory() as d:
     check("兩種授權看到同一則訊息只投遞一次", len(sent2) == 1)
     check("兩者都有 ack", c2.acks == 2)
 
+# 8b) 投遞失敗必須落地到 deadletter(已 ack,Slack 不會再送)
+class DownOC:
+    to="mira"
+    def post(self, body, meta): raise RuntimeError("officraft down")
+with _tf.TemporaryDirectory() as d:
+    dl = _pl.Path(d)/"dl3.jsonl"
+    h3 = bridge.make_handler(DownOC(), bridge.SeenEvents(_pl.Path(d)/"s3.db"), bridge.NameCache(None),
+                             dl, frozenset())
+    try: h3(FakeClient(), Req2("EvDL", True)); raised=False
+    except Exception: raised=True
+    check("投遞失敗不拋錯且寫進 deadletter", not raised and dl.exists() and "same message" in dl.read_text())
+
 # 9) 連線健康:連上即斷要在 15 分鐘內警示、恢復要說、同一次斷線一小時內不重複、正常時安靜
 class HealthOC:
     def __init__(self, fail=False): self.sent=[]; self.fail=fail

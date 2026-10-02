@@ -421,7 +421,7 @@ def make_handler(oc: OffiCraft, seen: SeenEvents, names: NameCache, deadletter: 
         except Exception as exc:  # noqa: BLE001
             # Already acked, so Slack will not send it again — the only way this
             # message survives is on our own disk.
-            LOG.error("DELIVERY FAILED %s: %s", event_id, exc)
+            LOG.error("DELIVERY FAILED %s: %s", key, exc)
             with deadletter.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"at": time.time(), "error": str(exc), "payload": payload},
                                     ensure_ascii=False) + "\n")

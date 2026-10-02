@@ -113,5 +113,5 @@ bot 只看得到**自己在場**的對話:被 `/invite` 邀進去的頻道、以
 ## 測試
 
 ```bash
-uv run python test_bridge.py    # 30 項:去重(含跨授權)、渲染、重試策略、401 續期、自我訊息過濾、連線健康警示
+uv run python test_bridge.py    # 31 項:去重(含跨授權)、渲染、重試策略、401 續期、自我訊息過濾、deadletter 落地、連線健康警示
 ```
