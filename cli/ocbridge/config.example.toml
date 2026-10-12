@@ -1,0 +1,34 @@
+# 複製到 ~/.officraft-slack-bridge/config.toml 並 chmod 600。
+# 這個檔案含兩組憑證,不要進 git。路徑可用環境變數 BRIDGE_CONFIG 覆蓋。
+
+[slack]
+# App-level token,scope 需要 connections:write。Socket Mode 靠它連線。
+app_token = "xapp-..."
+# Bot token。沒有的話 bridge 仍能運作,但訊息裡只會有 U…/C… 這種 id。
+bot_token = "xoxb-..."
+# 自己的 Slack user id:這些人發的訊息不轉進 officraft
+# (你要的是別人說了什麼,自己說的話不必再回報一次)。單一字串也接受。
+ignore_user_ids = ["U0EXAMPLE"]
+# 連線正常卻這麼多小時沒收到任何訊息事件(含自己發的)就警示;選填,省略、0 或負數 = 24。
+# silence_alert_hours = 24
+
+[officraft]
+base_url = "http://127.0.0.1:7755"   # 本機直連,不經 tunnel
+# 憑證不放這裡:跑一次 `ocbridge claim <claim-code>`,token 會寫進
+# state_dir/credential.json(0600)並由 ocbridge 自己續期。
+to       = "example-member"          # 收件成員 id;不可以是 machine
+
+[bridge]
+# credential.json、seen.json / github_seen.json(去重)與 deadletter.jsonl 的落點。
+# 省略時用 config.toml 所在的資料夾。
+state_dir = "~/.officraft-slack-bridge"
+
+[github]
+# 個人指名一律查;這裡列的是額外要查的 team
+teams = [
+  "example-org/example-team",
+]
+# 這些作者的 PR 不報(例如自動化 bot)
+exclude_authors = ["app/renovate", "app/dependabot", "app/github-actions"]
+# 省略時用 [officraft].to
+to = "example-member"

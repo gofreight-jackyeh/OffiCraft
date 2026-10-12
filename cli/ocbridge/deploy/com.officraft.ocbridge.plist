@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- TEMPLATE: replace __OCBRIDGE_BIN__ (absolute path to the ocbridge binary)
+     and __HOME__ (your home directory) before installing. See ../README.md. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.officraft.ocbridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__OCBRIDGE_BIN__</string>
+        <string>slack</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key><string>__HOME__</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>__HOME__/.officraft-slack-bridge/ocbridge.out.log</string>
+    <key>StandardErrorPath</key><string>__HOME__/.officraft-slack-bridge/ocbridge.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- TEMPLATE: replace __OCBRIDGE_BIN__ (absolute path to the ocbridge binary)
+     and __HOME__ (your home directory) before installing. PATH must reach the
+     `gh` CLI (Homebrew on Apple silicon: /opt/homebrew/bin). See ../README.md. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.officraft.ocbridge.github-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__OCBRIDGE_BIN__</string>
+        <string>github-watch</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key><string>__HOME__</string>
+    </dict>
+    <key>StartInterval</key><integer>3600</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>__HOME__/.officraft-slack-bridge/github-watch.out.log</string>
+    <key>StandardErrorPath</key><string>__HOME__/.officraft-slack-bridge/github-watch.err.log</string>
+</dict>
+</plist>
