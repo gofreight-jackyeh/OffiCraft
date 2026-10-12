@@ -202,6 +202,7 @@ type bridge struct {
 	names      *nameCache
 	deadletter string
 	ignore     map[string]bool
+	health     *connectionHealth // nil in tests that do not watch silence
 
 	// In-flight deliveries. Their envelopes are already acked, so on shutdown
 	// they must finish or land in deadletter — Slack will not send them again.
@@ -267,6 +268,11 @@ func (b *bridge) handleEvent(raw json.RawMessage) {
 		return
 	}
 	ev := p.Event
+	// Proof the Slack side still delivers, counted before every filter: the
+	// owner's own lines and bot chatter are as good a heartbeat as any.
+	if ev.Type == "message" && b.health != nil {
+		b.health.markEvent(time.Now())
+	}
 	if ev.Type != "message" || ev.BotID != "" || skipSubtypes[ev.Subtype] {
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,6 +244,9 @@ state_dir = "~/state"
 	if len(cfg.Slack.IgnoreUserIDs) != 1 || cfg.Slack.IgnoreUserIDs[0] != "U0EXAMPLE" {
 		t.Fatalf("a bare-string ignore_user_ids must be accepted: %v", cfg.Slack.IgnoreUserIDs)
 	}
+	if cfg.silenceAfter() != 24*time.Hour {
+		t.Fatalf("silence_alert_hours absent must default to 24h, got %s", cfg.silenceAfter())
+	}
 	if got := cfg.stateDir("/home/octocat"); got != "/home/octocat/state" {
 		t.Fatalf("state_dir ~ expansion: %s", got)
 	}
@@ -303,5 +307,22 @@ func TestShutdownDeadlineWritesDeadletter(t *testing.T) {
 	data, err := os.ReadFile(b.deadletter)
 	if err != nil || !strings.Contains(string(data), "shutdown before delivery finished") || !strings.Contains(string(data), "same message") {
 		t.Fatalf("unfinished delivery must land in deadletter: %s (%v)", data, err)
+	}
+}
+
+func TestConfigSilenceAlertHours(t *testing.T) {
+	for _, c := range []struct {
+		hours int
+		want  time.Duration
+	}{{6, 6 * time.Hour}, {0, 24 * time.Hour}, {-3, 24 * time.Hour}} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		os.WriteFile(path, []byte("[slack]\nsilence_alert_hours = "+strconv.Itoa(c.hours)+"\n"), 0o600)
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.silenceAfter(); got != c.want {
+			t.Fatalf("silence_alert_hours = %d: got %s, want %s", c.hours, got, c.want)
+		}
 	}
 }

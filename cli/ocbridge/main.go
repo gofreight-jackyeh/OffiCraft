@@ -157,9 +157,9 @@ func runSlack(ctx context.Context, cfg *Config, stateDir string, cred *Credentia
 		ignore[u] = true
 	}
 	oc := newOffiCraft(cfg.OffiCraft.BaseURL, cred, cfg.OffiCraft.To)
+	health := &connectionHealth{send: oc.Post, silenceAfter: cfg.silenceAfter(), lastEvent: time.Now()}
 	b := &bridge{oc: oc, seen: seen, names: names,
-		deadletter: filepath.Join(stateDir, "deadletter.jsonl"), ignore: ignore}
-	health := &connectionHealth{send: oc.Post}
+		deadletter: filepath.Join(stateDir, "deadletter.jsonl"), ignore: ignore, health: health}
 
 	go cred.keepFresh(ctx)
 	log.Printf("connecting to Slack (socket mode); delivering to %s", oc.to)

@@ -167,6 +167,20 @@ BrokenPipe、約 6 秒重連一次),log 看起來很忙,但什麼都進不來。
   (反過來,憑證續期以 wall clock 為準、每次最多等 1 小時,常睡眠的筆電也不會拖過到期日。)
 * process 整個掛掉由 launchd `KeepAlive` 處理,不在這裡。
 
+**連上了卻沒有訊息**(2026-10 曾這樣 16 天:連線一直健康,Slack 一則 message 事件都沒送,
+問題在 Slack App 端)是另一種失敗,同一支 `health.go` 另外盯:
+
+* 只要收到 `events_api` 的 `message` 事件就算「還活著」,**在任何過濾之前**計 — 你自己發的、
+  bot 發的、重送的都算(證明的是 Slack 那頭還在送)。
+* 連線正常且 **24 小時**(`[slack].silence_alert_hours`,選填,省略、0 或負數 = 24)沒有任何事件 →
+  發一則 `[Slack bridge 警示] Slack 連線正常,但自 <MM-DD HH:MM> 起已 N 小時沒收到任何訊息事件…`,
+  指向 Slack App 的 Event Subscriptions / 授權。仍然沒有時**每 24 小時最多再提醒一則**(不是每小時);
+  下一則事件進來就發一則 `[Slack bridge 已恢復]`。送不出去的處理同上(下次檢查重送)。
+* **斷線期間由斷線警示負責**:斷線中不發沒訊息警示;斷線(含恢復前那 2 分鐘穩定期)的時間
+  **不算進**沒訊息的時數,所以斷線恢復後也不會馬上補一則 — 要再連續連線 24 小時仍沒事件才發。
+  已發過沒訊息警示時,「24 小時提醒一次」的間隔同樣扣掉斷線時間。
+* 計時從 process 啟動開始,**不跨重啟保存**:重啟會把時鐘歸零,沒訊息要在重啟後滿 24 小時才發現。
+
 ## 誰的訊息會被轉進去
 
 * **只轉別人說的話**。`[slack].ignore_user_ids` 裡的人(預設是你自己)發的訊息會被丟掉 —
@@ -201,7 +215,9 @@ cd cli/ocbridge && go test ./... -count=1
 
 stdlib `testing`,無網路:OffiCraft 與 Slack 都是 `httptest` fake。涵蓋去重(含重啟、跨授權)、
 渲染、400/401/5xx 投遞策略、自我訊息過濾仍 ack、deadletter、github 渲染/查詢/行數上限/seeding、
-連線健康(`TestHealth1`–`TestHealth4` 對應 ①–④,另有 tick-only 斷線、警示失敗重送、斷線不重複計),
+連線健康(`TestHealth1`–`TestHealth4` 對應 ①–④,另有 tick-only 斷線、警示失敗重送、斷線不重複計)、
+連上卻沒訊息(`TestSilence1`–`TestSilence6`:24h 警示一次、事件來了恢復一次、23h59m 不發、
+自己的訊息算活著、斷線時只有斷線警示、48h 內只提醒一次),
 以及 end-to-end(`TestE2E_*`:fake Slack 接了就斷 → 持續重連且健康記到斷線;送一個
 events_api → 收到 ack、OffiCraft 收到一則)。CI 第 7 道 golang gate 自動涵蓋本 module
 (`bin/ci.sh` 掃 `cli/*/go.mod`)。

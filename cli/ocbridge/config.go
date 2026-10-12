@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -17,6 +18,8 @@ type Config struct {
 		AppToken      string     `toml:"app_token"`
 		BotToken      string     `toml:"bot_token"`
 		IgnoreUserIDs stringList `toml:"ignore_user_ids"`
+		// Optional (absent in configs from the Python era); omitted/0/negative = 24.
+		SilenceAlertHours int `toml:"silence_alert_hours"`
 	} `toml:"slack"`
 	OffiCraft struct {
 		BaseURL string `toml:"base_url"`
@@ -92,6 +95,14 @@ func (c *Config) validateSlack() error {
 		return fmt.Errorf("config %s: [slack].app_token must be an app-level token (xapp-...)", c.path)
 	}
 	return nil
+}
+
+// silenceAfter: [slack].silence_alert_hours, else defaultSilenceAfter.
+func (c *Config) silenceAfter() time.Duration {
+	if c.Slack.SilenceAlertHours <= 0 {
+		return defaultSilenceAfter
+	}
+	return time.Duration(c.Slack.SilenceAlertHours) * time.Hour
 }
 
 // stateDir: [bridge].state_dir with ~ expanded, else the config file's folder.
